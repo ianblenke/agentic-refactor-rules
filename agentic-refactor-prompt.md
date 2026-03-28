@@ -1214,10 +1214,12 @@ harness:
   #   3. Effort level: trade reasoning depth for speed on well-scoped tasks
   #   4. Model routing: use the cheapest model that produces acceptable quality
   #   5. Budget/turn limits: prevent runaway sessions
+  #   6. Mode: always use mode: "auto" — Claude plans better outside plan mode
 
   agents:
     discovery:                        # BMAD: Analyst Mary
       model: "claude-sonnet-4-6"      # research doesn't need Opus
+      mode: "auto"                    # never use plan mode — Claude plans better without it
       effort: "medium"                # balanced — research needs some reasoning
       prompt: ".harness/prompts/discovery.md"
       tools: ["Read", "Grep", "Glob", "WebSearch", "WebFetch"]  # all read-only → parallel
@@ -1235,6 +1237,7 @@ harness:
 
     planner:                          # BMAD: PM John
       model: "claude-sonnet-4-6"      # sufficient for planning, faster/cheaper
+      mode: "auto"                    # never use plan mode — Claude plans better without it
       effort: "medium"
       prompt: ".harness/prompts/planner.md"
       tools: ["Read", "Grep", "Glob", "Write"]  # scoped: no Bash, no Edit
@@ -1251,6 +1254,7 @@ harness:
 
     architect:                        # BMAD: Architect Winston
       model: "claude-opus-4-6"        # needs deep reasoning for design decisions
+      mode: "auto"                    # never use plan mode — Claude plans better without it
       effort: "high"
       prompt: ".harness/prompts/architect.md"
       tools: ["Read", "Grep", "Glob", "Write"]  # scoped: read codebase + write design docs
@@ -1266,6 +1270,7 @@ harness:
 
     design:                           # BMAD: UX Designer Sally
       model: "claude-sonnet-4-6"
+      mode: "auto"                    # never use plan mode — Claude plans better without it
       effort: "medium"
       prompt: ".harness/prompts/design.md"
       tools: ["Read", "Grep", "Glob", "Write"]  # scoped: no Bash, no browser
@@ -1281,6 +1286,7 @@ harness:
 
     generator:                        # BMAD: Developer Amelia
       model: "claude-opus-4-6"        # best for sustained implementation sessions
+      mode: "auto"                    # never use plan mode — Claude plans better without it
       effort: "high"                  # implementation needs thorough reasoning
       prompt: ".harness/prompts/generator.md"
       tools: ["Read", "Edit", "Write", "Grep", "Glob", "Bash"]  # full dev toolset, no Playwright
@@ -1298,6 +1304,7 @@ harness:
 
     evaluator:                        # BMAD: QA Quinn
       model: "claude-opus-4-6"
+      mode: "auto"                    # never use plan mode — Claude plans better without it
       effort: "high"                  # QA needs thorough analysis to catch issues
       prompt: ".harness/prompts/evaluator.md"
       tools: ["Read", "Grep", "Glob", "Bash"]  # + Playwright MCP if web app
@@ -1585,7 +1592,9 @@ Parallelism must be both **enabled** (annotation) and **encouraged** (system pro
 
 ### E.2 Model Routing Per Agent Role
 
-Each BMAD role has different reasoning requirements. Use the cheapest model that produces acceptable quality:
+Each BMAD role has different reasoning requirements. Use the cheapest model that produces acceptable quality.
+
+**Mode:** All agents use `mode: "auto"`. Never use `mode: "plan"` — Claude plans better when not constrained to plan mode.
 
 | Agent | Model | Effort | Rationale |
 |---|---|---|---|
