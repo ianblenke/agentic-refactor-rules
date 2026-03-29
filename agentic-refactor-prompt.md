@@ -505,6 +505,7 @@ evaluation:
    i. If fail + no retries: escalate to user, log in `ops/known-issues.md`
 3. After all stories: launch final cross-story evaluation
 4. Run reconciliation steps (update ops docs, traceability, architecture date)
+5. **Before shutting down any agent, mark all of its tasks as complete** — stale in-progress tasks corrupt state for future sessions and crash-recovery
 
 **Conditional agent invocation**: The orchestrator decides when to invoke optional agents:
 - **Discovery Agent (Mary)**: Invoked when the user's request references an unfamiliar domain or when the planner's handoff includes `ready_for_planning: false`
@@ -536,6 +537,7 @@ orchestrator_state:
       started: "<ISO-8601>"
       ended: "<ISO-8601> or null"
       status: "running" | "completed" | "failed"
+      tasks_cleaned: true | false      # all tasks marked complete/failed before shutdown
       cost: "$X.XX"
 
   totals:
@@ -1644,6 +1646,8 @@ ClaudeAgentOptions(
 ```
 
 When an agent hits its turn or budget limit, it should write a handoff with status `context_limit` and the remaining work — the orchestrator then launches a fresh agent to continue.
+
+**Task cleanup before agent shutdown**: The orchestrator must mark all of an agent's tasks as complete (or failed) before terminating it. This applies to all shutdown paths: normal completion, budget/turn limits, retries, and escalations. Stale in-progress tasks corrupt state for crash recovery and confuse subsequent agents.
 
 ### E.5 Reducing Tool Failures and Retries
 
