@@ -648,28 +648,43 @@ Testing is not a step that happens after implementation — it is the enforcemen
 Every layer of the test pyramid traces back to OpenSpec artifacts:
 
 ```
-                    +-----------------------+
-                    |     E2E Tests         |  SCENARIO-* across capabilities
-                    |  (Playwright, real    |  Full deployed stack, real DNS
-                    |   protocol exchanges) |  ops/e2e-test-plan.md
-                    +-----------------------+
-                  +-----------------------------+
-                  |    Integration Tests         |  SCENARIO-* within capability
-                  |  (Real DB, real services,    |  Cross-component interactions
-                  |   no mocks at boundaries)    |  openspec/capabilities/*/spec.md
-                  +-----------------------------+
-               +------------------------------------+
-               |         Unit Tests                  |  REQ-* individual behaviors
-               |  (Single function/module,           |  Isolated logic, fast feedback
-               |   mocks OK for external deps)       |  Referenced by REQ-<CAP>-NNN
-               +------------------------------------+
+                 +--------------------------+
+                 |       E2E Tests          |  SCENARIO-* across capabilities
+                 |  (Playwright, real       |  Full deployed stack, real DNS
+                 |   protocol exchanges)    |  ops/e2e-test-plan.md
+                 +--------------------------+
+               +------------------------------+
+               |      Contract Tests           |  API shape validation between
+               |  (Schema-validated stubs,     |  components — catches silent
+               |   consumer-driven contracts)  |  contract drift
+               +------------------------------+
+             +----------------------------------+
+             |     Integration Tests             |  SCENARIO-* within capability
+             |  (Real DB, real services,         |  Cross-component interactions
+             |   no mocks at boundaries)         |  openspec/capabilities/*/spec.md
+             +----------------------------------+
+          +---------------------------------------+
+          |          Unit Tests                    |  REQ-* individual behaviors
+          |  (Single function/module,              |  Isolated logic, fast feedback
+          |   mocks OK for external deps)          |  Referenced by REQ-<CAP>-NNN
+          +---------------------------------------+
+
+  (Orthogonal — applies when the project is itself a testing/compliance tool):
+
+          +---------------------------------------+
+          |    Conformance Fixture Tests           |  Golden fixtures (all pass) +
+          |  (Known-good + known-bad mocks,        |  poison fixtures (targeted fail)
+          |   false-positive/false-negative gates)  |  tests/conformance_fixtures/
+          +---------------------------------------+
 ```
 
 | Test Layer | What It Verifies | OpenSpec Anchor | Who Writes | Who Runs | When |
 |---|---|---|---|---|---|
 | **Unit** | Individual REQ-* behaviors in isolation | `REQ-<CAP>-NNN` in test comments | Generator (Amelia) | Generator (self-check) + Evaluator (verification) | Every sprint |
 | **Integration** | SCENARIO-* within a single capability | `SCENARIO-<CAP>-NNN` in test comments | Generator (Amelia) | Evaluator (Quinn) | Every sprint |
+| **Contract** | API response shapes match consumer expectations | `CONTRACT-<CAP>-NNN` in test comments | Generator (Amelia) | Generator (self-check) + Evaluator (verification) | Every sprint |
 | **E2E** | SCENARIO-* across capabilities, full stack | `ops/e2e-test-plan.md` mapped to SCENARIO-* | Planner defines plan, Generator implements | Evaluator (Quinn) against deployed system | Every sprint + final evaluation |
+| **Conformance Fixture** | Assertions detect both conformant and non-conformant behavior | `FIXTURE-<CAP>-NNN` in test comments | Generator (Amelia) | Evaluator (Quinn) | Every sprint (when project is a compliance/testing tool) |
 
 ### 5.2 Test-Spec Traceability Contract
 
@@ -817,6 +832,11 @@ The evaluator does NOT trust the generator's self-reported test results. Quinn i
 9. For every REQ-* marked "Implemented", verify a test exists that references it
 10. For every SCENARIO-* in the sprint contract, verify a test exercises the full Given/When/Then flow
 11. Flag **phantom coverage**: tests that reference a REQ-* but don't actually exercise the requirement (e.g., testing only the happy path when the REQ-* specifies error handling)
+12. **Assertion-to-spec traceability audit**: For each test that references a REQ-* or SCENARIO-*, read the assertion body and compare it against the actual spec text. Verify that what the test asserts matches what the spec requires — not just that a citation exists. Common failures:
+    - Test asserts `status == 200` but spec says "SHALL return a valid XML capabilities document with elements X, Y, Z"
+    - Test checks response is non-empty but spec defines a specific schema
+    - Test verifies a header exists but spec mandates a specific header value
+    - Test exercises a subset of the Given/When/Then but omits the Then conditions that matter
 
 **E2E verification** (for every sprint, not just final):
 12. Run E2E tests from `ops/e2e-test-plan.md` against the deployed system
@@ -847,11 +867,14 @@ The evaluator does NOT trust the generator's self-reported test results. Quinn i
       reqs_with_tests: 5
       reqs_without_tests: 0
       phantom_coverage: 1     # test exists but doesn't exercise the actual requirement
+      assertion_spec_mismatches: 1  # test cites REQ-* but assertions don't match spec text
       scenarios_verified: 8
       scenarios_unverified: 1
       details:
         - req_id: "REQ-AUTH-003"
           issue: "test references REQ-AUTH-003 (rate limiting) but only tests a single failed attempt — never triggers the lockout threshold"
+        - req_id: "REQ-AUTH-001"
+          issue: "assertion-spec mismatch: test asserts status == 200, but spec says 'SHALL return a JWT token with sub, exp, and iat claims' — status code is necessary but not sufficient"
 
     code_coverage:
       line_coverage: 0.83     # evaluator's independent measurement
@@ -900,6 +923,10 @@ The evaluator independently runs all checks and adds its own. Failure here means
 | Scenario pass rate | >= 90% (100% for critical) | Sprint fails if critical; warning if non-critical |
 | Code coverage on new files | >= 80% line, >= 70% branch | Sprint fails — "files X, Y below threshold" in critique |
 | No phantom coverage | 0 instances | Sprint fails — "test for REQ-X-NNN doesn't exercise the requirement" |
+| No assertion-spec mismatches (critical) | 0 instances | Sprint fails — "test for REQ-X-NNN asserts status code but spec requires schema validation" |
+| No assertion-spec mismatches (partial) | 0 instances | Warning — noted in critique, hard fail deferred to Gate 3 |
+| Contract tests pass (if applicable) | 100% | Sprint fails — "CONTRACT-X-NNN: producer/consumer schema mismatch" |
+| Conformance fixture tests pass (if applicable) | 100% golden + 100% poison | Sprint fails — false positive/negative detected in compliance assertions |
 | No test isolation violations | 0 instances | Sprint fails — "test X depends on test Y execution order" |
 | E2E tests pass | 100% for contracted scenarios | Sprint fails — E2E evidence included in critique |
 | Test quality: no trivial tests | 0 instances | Warning (not hard fail) — noted in critique for next iteration |
@@ -914,8 +941,225 @@ Full regression and cross-story integration testing:
 | Cross-story E2E scenarios | 100% pass | Escalate to user — integration gap between stories |
 | Overall project code coverage | No regression from pre-refactor baseline | Warning — coverage decreased, investigate which REQ-* lost tests |
 | Traceability matrix consistency | All "Implemented" REQ-* show "Covered" | Hard fail — traceability out of sync, reconcile before done |
+| Assertion-spec mismatches (partial) | 0 remaining | Hard fail — all partial mismatches from Gate 2 must be resolved by final evaluation |
+| Contract test coverage | All API boundaries have contracts | Hard fail — uncontracted boundaries risk silent breakage |
+| Conformance fixture coverage (if applicable) | Every REQ-* with compliance assertions has golden + poison fixtures | Hard fail — untested assertion correctness |
 
-### 5.7 Test Infrastructure Bootstrap
+### 5.7 Conformance Fixture Tests ("Testing the Tester")
+
+**When this applies**: The project being refactored is itself a compliance testing tool, validator, or conformance checker (e.g., OGC spec compliance, OAuth conformance, FHIR validation). In these projects, the test pyramid validates that your code works, but not that your assertions are correct. Conformance fixture tests close this gap.
+
+**The problem**: A compliance tool can pass all unit, integration, and E2E tests while still producing false positives (accepting non-conformant input) or false negatives (rejecting conformant input). Standard test levels don't catch this because they verify behavior, not correctness of judgment.
+
+**Structure**:
+
+```
+tests/
+  conformance_fixtures/
+    <cap>/
+      golden/                        # Known-conformant fixtures — every assertion MUST pass
+        fixture_valid_001.json       # Known-good input with rationale
+        fixture_valid_002.xml
+        expected_results.yaml        # Expected: all checks pass, no violations
+      poison/                        # Known-non-conformant fixtures — targeted assertions MUST fail
+        fixture_invalid_001.json     # Known-bad input with specific violation
+        fixture_invalid_002.xml
+        expected_results.yaml        # Expected: specific checks fail, others pass
+      manifest.yaml                  # Maps each fixture to REQ-*/SCENARIO-* and spec citation
+```
+
+**Fixture manifest format**:
+
+```yaml
+fixtures:
+  - id: "FIXTURE-WMS-001"
+    type: "golden"                   # golden = known-conformant, poison = known-non-conformant
+    file: "golden/valid_capabilities_130.xml"
+    spec_citation: "OGC WMS 1.3.0 §7.2.4.1: GetCapabilities response SHALL be a valid XML document"
+    requirements_exercised:
+      - "REQ-WMS-001"
+      - "REQ-WMS-003"
+    expected_verdict: "pass"         # all assertions against this fixture should pass
+    expected_violations: []
+
+  - id: "FIXTURE-WMS-002"
+    type: "poison"
+    file: "poison/missing_layer_element.xml"
+    spec_citation: "OGC WMS 1.3.0 §7.2.4.6.2: Layer element is mandatory"
+    requirements_exercised:
+      - "REQ-WMS-005"
+    expected_verdict: "fail"
+    expected_violations:
+      - check: "layer_element_present"
+        reason: "Layer element deliberately omitted to test detection"
+    must_not_trigger:                # guards against false positives from this poison fixture
+      - "REQ-WMS-001"               # XML validity should still pass — the doc is well-formed
+```
+
+**Gates**:
+
+| Check | Threshold | Action on Failure |
+|---|---|---|
+| All golden fixtures produce 0 violations | 100% | Hard fail — false negative detected, assertions are too strict or broken |
+| All poison fixtures trigger expected violations | 100% | Hard fail — false positive detected, assertions miss non-conformance |
+| Poison fixtures do NOT trigger `must_not_trigger` checks | 0 false positives | Hard fail — unrelated assertions failing on targeted poison input |
+
+**Evaluator report section** (added to evaluation schema):
+
+```yaml
+    conformance_fixtures:
+      golden_fixtures_total: 12
+      golden_passed: 12              # all assertions pass on known-good input
+      golden_false_negatives: 0      # assertions that incorrectly reject good input
+      poison_fixtures_total: 8
+      poison_caught: 7               # expected violations correctly detected
+      poison_false_positives: 1      # a poison fixture triggered an unrelated check
+      poison_missed: 0               # expected violations not detected (false positive in the tool)
+      details:
+        - fixture: "FIXTURE-WMS-002"
+          issue: "poison fixture for missing Layer also triggers REQ-WMS-012 (CRS validation) — likely over-broad assertion"
+```
+
+### 5.8 Contract Tests (API Shape Validation)
+
+Contract tests validate that components agree on shared API response shapes. They sit between integration tests and E2E tests in the pyramid. Without them, a backend change to a response schema breaks the frontend silently — unit tests mock the boundary, integration tests may test each side independently, and E2E tests catch it late with poor diagnostics.
+
+**The pattern**: For every API boundary between components, define a contract that specifies the request/response schema. Both producer (backend) and consumer (frontend) test against this contract independently.
+
+**Structure**:
+
+```
+tests/
+  contracts/
+    <api_boundary>/
+      schema.yaml                    # Shared API contract (OpenAPI fragment or JSON Schema)
+      test_producer.py               # Backend: responses match schema
+      test_consumer.py               # Frontend: can parse and render responses matching schema
+```
+
+**Contract definition format**:
+
+```yaml
+# tests/contracts/discovery_api/schema.yaml
+contract:
+  id: "CONTRACT-DISC-001"
+  endpoint: "GET /api/discovery/{id}/result"
+  requirements:
+    - "REQ-DISC-004"                 # Discovery results retrievable via API
+    - "SCENARIO-DISC-002"            # Frontend displays discovery results
+
+  response_schema:
+    type: object
+    required: ["id", "status", "results", "timestamp"]
+    properties:
+      id:
+        type: string
+        format: uuid
+      status:
+        type: string
+        enum: ["pending", "running", "completed", "failed"]
+      results:
+        type: array
+        items:
+          type: object
+          required: ["checkId", "passed", "message"]
+      timestamp:
+        type: string
+        format: date-time
+
+  breaking_change_policy: "Any removal or type change to a required field is a breaking change. Adding optional fields is non-breaking."
+```
+
+**Test implementation**:
+
+```python
+# tests/contracts/discovery_api/test_producer.py
+# CONTRACT-DISC-001: Discovery API response shape
+# REQ-DISC-004: Discovery results retrievable via API
+
+def test_discovery_result_matches_contract(running_server, contract_schema):
+    """Backend produces responses conforming to the shared contract."""
+    response = requests.get(f"{running_server}/api/discovery/{test_id}/result")
+    validate(response.json(), contract_schema)  # jsonschema validation
+
+
+# tests/contracts/discovery_api/test_consumer.py
+# CONTRACT-DISC-001: Discovery API response shape
+# SCENARIO-DISC-002: Frontend displays discovery results
+
+def test_frontend_parses_contract_response(contract_schema):
+    """Frontend correctly parses every valid contract response shape."""
+    for example in generate_examples(contract_schema):
+        component = render_discovery_result(example)
+        assert component.status_text == example["status"]
+        assert len(component.result_rows) == len(example["results"])
+```
+
+**Gates**:
+
+| Check | Threshold | Action on Failure |
+|---|---|---|
+| Producer tests pass (backend matches contract) | 100% | Sprint fails — backend broke the API contract |
+| Consumer tests pass (frontend handles contract) | 100% | Sprint fails — frontend doesn't handle valid responses |
+| No uncontracted API boundaries | 0 | Warning — new endpoint added without contract definition |
+
+**When to add contracts**: Any API boundary where:
+- Frontend consumes backend responses
+- Service A calls Service B
+- A published API is consumed by external clients
+- Prior bugs were caused by schema drift between components
+
+### 5.9 Assertion-to-Spec Traceability Audit
+
+Beyond phantom coverage (tests that cite REQ-* but don't exercise the requirement), the evaluator must verify that **what each test asserts actually matches what the spec requires**. A traceability header creates a *claim* of coverage. This audit verifies the claim.
+
+**Audit procedure** (performed by Evaluator during Gate 2):
+
+For each test that references a REQ-* or SCENARIO-*:
+
+1. **Read the spec text**: Open `openspec/capabilities/<cap>/spec.md`, find the referenced REQ-*/SCENARIO-*
+2. **Read the test assertions**: Identify every `assert`, `expect`, or equivalent statement in the test
+3. **Compare**: Does the assertion verify what the spec actually requires?
+
+**Common failure patterns**:
+
+| Pattern | Example | Why It's Wrong |
+|---|---|---|
+| **Status-code-only** | Spec: "SHALL return valid XML with elements X, Y, Z" → Test: `assert status == 200` | Status code confirms the request succeeded, not that the response is correct |
+| **Existence-only** | Spec: "response MUST include `Authorization` header with value `Bearer <token>`" → Test: `assert 'Authorization' in headers` | Header exists but value could be anything |
+| **Subset assertion** | Spec: "Given invalid credentials, When login, Then return 401 AND increment lockout counter AND log security event" → Test: `assert status == 401` | Two of three Then-conditions are unverified |
+| **Shape-without-content** | Spec: "error response MUST include `code`, `message`, and `detail` fields" → Test: `assert isinstance(response, dict)` | Dict shape is untested |
+| **Wrong granularity** | Spec: "rate limit of 100 requests per minute" → Test: `assert rate_limited == True` (after 1 request) | Threshold is never actually tested |
+
+**Evaluator report section** (added to evaluation schema):
+
+```yaml
+    assertion_spec_audit:
+      tests_audited: 45
+      assertions_verified: 142
+      mismatches_found: 3
+      severity_breakdown:
+        critical: 1       # assertion completely misses the requirement
+        partial: 2         # assertion covers part of the requirement
+      details:
+        - test: "test_capabilities_response"
+          req_id: "REQ-WMS-001"
+          spec_text: "GetCapabilities response SHALL be a valid XML document conforming to schemas/wms/1.3.0/capabilities.xsd"
+          assertion: "assert response.status_code == 200"
+          verdict: "critical mismatch — status code does not verify XML validity or schema conformance"
+          recommended_fix: "Parse response body as XML, validate against capabilities.xsd schema"
+        - test: "test_login_flow"
+          req_id: "SCENARIO-AUTH-001"
+          spec_text: "Given valid credentials, When user submits login, Then JWT issued with sub+exp+iat AND user redirected to /dashboard"
+          assertion: "assert 'token' in response.json()"
+          verdict: "partial — token presence checked but JWT claims (sub, exp, iat) and redirect not verified"
+```
+
+**Gate integration**: Assertion-spec mismatches are graded by severity:
+- **Critical** (assertion completely misses the requirement): Hard fail at Gate 2
+- **Partial** (assertion covers some but not all conditions): Warning at Gate 2, hard fail at Gate 3
+
+### 5.10 Test Infrastructure Bootstrap
 
 When refactoring an existing project, the test infrastructure must be established before the first generator sprint:
 
@@ -940,8 +1184,22 @@ tests/
         ...
       integration/
         ...
-  conftest.py                   # shared fixtures
-  coverage.ini                  # coverage configuration
+  contracts/                          # API shape contracts (Section 5.8)
+    discovery_api/
+      schema.yaml                     # CONTRACT-DISC-001
+      test_producer.py
+      test_consumer.py
+  conformance_fixtures/               # Golden/poison fixtures (Section 5.7, when applicable)
+    wms/
+      golden/
+        valid_capabilities_130.xml
+        expected_results.yaml
+      poison/
+        missing_layer_element.xml
+        expected_results.yaml
+      manifest.yaml
+  conftest.py                         # shared fixtures
+  coverage.ini                        # coverage configuration
 ```
 
 5. **Create `ops/e2e-test-plan.md`**:
@@ -1411,6 +1669,24 @@ Before ending a session:
 - [ ] Configure coverage thresholds in `.harness/config.yaml` (spec coverage + code coverage)
 - [ ] Wire coverage reporting into test runner (coverage report generated on every run)
 
+### Contract Tests (Phase 5.8)
+
+- [ ] Identify all API boundaries between components (frontend↔backend, service↔service)
+- [ ] Create `tests/contracts/` directory with schema + producer/consumer test pairs per boundary
+- [ ] Define shared schema (OpenAPI fragment or JSON Schema) for each contracted endpoint
+- [ ] Write producer tests: backend responses validate against shared schema
+- [ ] Write consumer tests: frontend/client correctly parses all valid schema shapes
+- [ ] Add CONTRACT-* IDs to traceability headers and `_bmad/traceability.md`
+
+### Conformance Fixture Tests (Phase 5.7 — when project is a compliance/testing tool)
+
+- [ ] Create `tests/conformance_fixtures/` directory structure with golden/ and poison/ subdirectories
+- [ ] Build golden fixtures: known-conformant inputs where every assertion MUST pass
+- [ ] Build poison fixtures: known-non-conformant inputs where targeted assertions MUST fail
+- [ ] Write fixture manifests mapping each fixture to REQ-*/SCENARIO-* and spec citations
+- [ ] Define `must_not_trigger` guards on poison fixtures to catch false positives
+- [ ] Add FIXTURE-* IDs to traceability headers
+
 ### Test-Spec Linkage
 
 - [ ] Ensure every test file has a traceability header referencing REQ-* and SCENARIO-*
@@ -1419,14 +1695,18 @@ Before ending a session:
 - [ ] Verify no orphan tests exist (tests without REQ-*/SCENARIO-* references)
 - [ ] Verify no phantom coverage exists (tests that reference a REQ-* but don't actually exercise it)
 - [ ] Verify SCENARIO-* use Given/When/Then BDD format in spec.md
+- [ ] Perform assertion-to-spec traceability audit: verify each test's assertions match the actual spec text, not just that a REQ-* citation exists
 
 ### Coverage Enforcement
 
 - [ ] Configure Gate 1 (generator self-check): tests pass + coverage thresholds on new files
-- [ ] Configure Gate 2 (evaluator verification): independent test run + spec coverage audit + test quality check + E2E
-- [ ] Configure Gate 3 (final evaluation): full regression + cross-story E2E + traceability consistency
+- [ ] Configure Gate 2 (evaluator verification): independent test run + spec coverage audit + test quality check + assertion-spec audit + contract tests + conformance fixtures + E2E
+- [ ] Configure Gate 3 (final evaluation): full regression + cross-story E2E + traceability consistency + all partial assertion mismatches resolved + contract coverage complete
 - [ ] Set hard-fail threshold: spec coverage = 100% of implemented REQ-* must be tested
 - [ ] Set hard-fail threshold: critical SCENARIO-* pass rate = 100%
+- [ ] Set hard-fail threshold: assertion-spec critical mismatches = 0
+- [ ] Set hard-fail threshold: contract test pass rate = 100% (when contracts exist)
+- [ ] Set hard-fail threshold: conformance fixtures = 100% golden pass + 100% poison detection (when applicable)
 - [ ] Set configurable threshold: code coverage on new files (default 80% line, 70% branch)
 - [ ] Set no-regression rule: overall project coverage must not decrease sprint-over-sprint
 - [ ] Document coverage waiver process: how to document and approve exceptions for untestable requirements
@@ -1521,6 +1801,9 @@ For projects that don't need the full BMAD ceremony:
 | Trusting generator's self-reported test results | Generator may have test pollution, cached results, or order-dependent tests | Evaluator runs full suite independently from clean state |
 | Code coverage as the only metric | 100% line coverage with trivial assertions proves nothing | Spec coverage (REQ-* tested) is primary; code coverage is secondary safety net |
 | Tests that reference REQ-* but don't exercise it | Phantom coverage — traceability looks complete but requirements are unverified | Evaluator audits test bodies against requirement descriptions, flags phantom coverage |
+| Tests that cite REQ-* but assert the wrong thing | Assertion-spec mismatch — test passes but doesn't verify what the spec requires (e.g., checking status 200 when spec mandates schema conformance) | Assertion-to-spec traceability audit compares test assertions against actual spec text (Section 5.9) |
+| No API contract tests between components | Backend changes response shape, frontend breaks silently; caught late by E2E with poor diagnostics | Contract tests validate shared API schemas from both producer and consumer sides (Section 5.8) |
+| Compliance tool with no conformance fixtures | False positives (accepting bad input) and false negatives (rejecting good input) go undetected by standard test pyramid | Golden and poison fixture tests verify assertion correctness, not just code correctness (Section 5.7) |
 | Writing tests after implementation | Tests shaped by implementation rather than specification; misses spec intent | TDD: generator writes test stubs from SCENARIO-* before implementation code |
 | E2E tests only at the end | Integration bugs compound across sprints; late discovery = expensive rework | E2E per sprint, not just final evaluation |
 | No negative tests | Happy path tested, error paths assumed to work | Every SCENARIO-* that specifies error behavior must have a negative test |
