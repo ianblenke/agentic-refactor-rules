@@ -41,6 +41,7 @@ The harness maps BMAD's virtual team roles to discrete agent contexts with full 
 | Developer (Amelia) | **Generator Agent** | Fresh per sprint/story | Code, `openspec/capabilities/*/spec.md` updates, handoff artifacts |
 | QA (Quinn) | **Evaluator Agent** | Fresh per evaluation | `.harness/evaluations/`, `ops/test-results.md` |
 | UX Designer (Sally) | **Design Agent** (optional) | Fresh per design task | `_bmad/ux-spec.md`, design tokens |
+| Skill Evolver (Trace2Skill) | **Skill Evolution Agent** | Fresh per evolution cycle | `.harness/skills/`, `.harness/patches/` |
 
 **Critical rule**: No two BMAD roles share a context window. The orchestrator is a stateless script, not an LLM — it reads handoff files and launches the next agent.
 
@@ -88,12 +89,20 @@ project-root/
       design.md                       # UX Designer Sally
       generator.md                    # Developer Amelia
       evaluator.md                    # QA Quinn
+      skill-evolver.md                # Trace2Skill evolution agent
     handoffs/                         # Structured handoff artifacts
       handoff-<session-id>.yaml
     contracts/                        # Sprint contracts
       contract-sprint-<N>.yaml
     evaluations/                      # Evaluation reports
       eval-sprint-<N>.yaml
+    skills/                           # Skill evolution artifacts (Trace2Skill)
+      SKILL.md                        # Root skill document (evolved over time)
+      scripts/                        # Executable helpers distilled from traces
+      references/                     # Edge-case guidance (low-prevalence patterns)
+      changelog.yaml                  # Skill version history with evolution rationale
+    patches/                          # Trajectory-specific patches (intermediate artifacts)
+      patch-sprint-<N>.yaml           # Per-sprint skill patches before consolidation
 
   ops/                                # Operational tracking
     status.md                         # What's working, what's next (session handoff doc)
@@ -1581,6 +1590,35 @@ harness:
       reads: ["openspec/", "epics/stories/", "_bmad/ux-spec.md", ".harness/contracts/", "ops/e2e-test-plan.md"]
       writes: [".harness/evaluations/", "ops/test-results.md"]
 
+    skill_evolver:                    # Trace2Skill evolution agent
+      model: "claude-sonnet-4-6"      # analysis doesn't need Opus; volume matters more
+      mode: "auto"
+      effort: "medium"
+      prompt: ".harness/prompts/skill-evolver.md"
+      tools: ["Read", "Grep", "Glob", "Write"]
+      tool_annotations:
+        Read: { readOnlyHint: true }
+        Grep: { readOnlyHint: true }
+        Glob: { readOnlyHint: true }
+      invocation: "conditional"       # triggered by orchestrator after N sprints
+      max_turns: 30
+      max_budget_usd: 5.00
+      reads: [".harness/handoffs/", ".harness/evaluations/", ".harness/prompts/", ".harness/skills/"]
+      writes: [".harness/patches/", ".harness/skills/", ".harness/prompts/"]
+      sub_agents:
+        error_analyst:                # 𝒜⁻ — one per failed trace, runs in parallel
+          model: "claude-sonnet-4-6"
+          mode: "auto"
+          effort: "medium"
+          max_turns: 15
+          max_budget_usd: 1.00
+        success_analyst:              # 𝒜⁺ — one per successful trace, runs in parallel
+          model: "claude-haiku-4-5-20251001"  # lighter analysis for success patterns
+          mode: "auto"
+          effort: "low"
+          max_turns: 10
+          max_budget_usd: 0.50
+
     # orchestrator is NOT listed here — it is a script, not an LLM agent
     # see: scripts/orchestrate.py
 
@@ -1632,7 +1670,277 @@ Before ending a session:
 
 ---
 
-## Phase 8: Refactor Execution Checklist
+## Phase 8: Skill Evolution (Trace2Skill)
+
+Agent prompts are skills — structured knowledge that shapes agent behavior. Without systematic evolution, prompts are written once and then diverge from what actually works as the project accumulates execution experience. This phase introduces a Trace2Skill loop (inspired by [Trace2Skill](https://arxiv.org/abs/2603.25158)) that evolves agent prompts from execution traces, closing the gap between observed outcomes and encoded guidance.
+
+### 8.1 Core Concepts
+
+**Skills as evolving artifacts**: Each agent prompt in `.harness/prompts/` is a skill — a structured knowledge package combining procedural guidance (the prompt itself), executable helpers (scripts), and edge-case references. Skills start as human-authored or LLM-drafted documents and improve through systematic analysis of execution traces.
+
+**Execution traces**: Every sprint produces traces — the handoff artifact, evaluator report, retry history, git diff, and (when available) the raw conversation. These traces encode what worked, what failed, and why.
+
+**The evolution loop**:
+
+```
+                    ┌─────────────────────────────────┐
+                    │   Sprint Execution (Phase 6)     │
+                    │   Agent πθ runs with skill 𝒮ₙ    │
+                    └──────────┬──────────────────────┘
+                               │
+                               ▼
+                    ┌─────────────────────────────────┐
+                    │   Trace Collection               │
+                    │   Handoffs + evaluations +       │
+                    │   retry history + git diffs      │
+                    └──────────┬──────────────────────┘
+                               │
+                    ┌──────────▼──────────────────────┐
+                    │   Parallel Patch Proposal         │
+                    │   Independent analysts examine    │
+                    │   each trace against current 𝒮ₙ   │
+                    └──────────┬──────────────────────┘
+                               │
+                    ┌──────────▼──────────────────────┐
+                    │   Hierarchical Consolidation     │
+                    │   Merge patches, resolve          │
+                    │   conflicts, filter by prevalence │
+                    └──────────┬──────────────────────┘
+                               │
+                    ┌──────────▼──────────────────────┐
+                    │   Evolved Skill 𝒮ₙ₊₁             │
+                    │   Updated .harness/prompts/       │
+                    │   + scripts/ + references/        │
+                    └──────────┬──────────────────────┘
+                               │
+                               └───────── feeds back ──→ next sprint
+```
+
+### 8.2 Trace Collection
+
+After each sprint (or batch of sprints), collect traces and partition them:
+
+```yaml
+# .harness/skills/traces.yaml (intermediate, regenerated each evolution cycle)
+traces:
+  successful:   # 𝒯⁺ — sprints that passed evaluator on first attempt
+    - sprint: 3
+      handoff: ".harness/handoffs/handoff-sprint-3.yaml"
+      evaluation: ".harness/evaluations/eval-sprint-3.yaml"
+      git_diff: "git diff sprint-2..sprint-3"
+      agent: "generator"
+
+  failed:       # 𝒯⁻ — sprints that failed evaluator or required retries
+    - sprint: 5
+      handoff: ".harness/handoffs/handoff-sprint-5.yaml"
+      evaluation: ".harness/evaluations/eval-sprint-5.yaml"
+      retry_count: 2
+      failure_class: "phantom coverage — tests cited REQ-* but didn't exercise it"
+      agent: "generator"
+
+  evaluator_traces:  # separate track for evaluator skill evolution
+    - sprint: 5
+      evaluation: ".harness/evaluations/eval-sprint-5.yaml"
+      missed_issues: ["rate limiting not enforced — caught in E2E but not spec audit"]
+      false_alarms: []
+```
+
+### 8.3 Parallel Patch Proposal
+
+Independent analyst sub-agents examine each trace and propose patches to the relevant skill. Each analyst operates on a **frozen copy** of the current skill — no analyst sees another's patches, preserving diversity.
+
+**Error Analyst (𝒜⁻)** — for failed traces:
+1. Read the failed sprint's handoff, evaluator critique, and retry history
+2. Read the current skill that the agent was using (`.harness/prompts/<agent>.md`)
+3. Identify the root cause: Was the failure due to missing guidance in the prompt? Ambiguous instruction? Incorrect procedure?
+4. Propose a **skill patch**: a specific edit to the prompt, a new script, or a new reference document
+5. Include causal evidence: "Sprint 5 failed because the generator didn't recalculate formulas after cell writes. The prompt says nothing about formula dependencies."
+
+**Success Analyst (𝒜⁺)** — for successful traces:
+1. Read the successful sprint's handoff and evaluator report
+2. Identify generalizable patterns: What did the agent do that worked well and isn't already captured in the skill?
+3. Propose a patch that encodes the effective pattern
+4. Flag patterns that are already in the skill (reinforcement signal, not a new patch)
+
+**Patch format**:
+
+```yaml
+# .harness/patches/patch-sprint-5.yaml
+patch:
+  id: "PATCH-GEN-005"
+  source_trace: "sprint-5"
+  trace_type: "failure"       # or "success"
+  target_skill: ".harness/prompts/generator.md"
+  root_cause: "Generator wrote cell values but didn't trigger formula recalculation. Downstream cells showed stale computed values."
+  proposed_edit:
+    type: "append_section"    # append_section | modify_section | add_script | add_reference
+    location: "## Implementation Checklist"
+    content: |
+      ### Formula Recalculation
+      After writing cell values that feed into formulas, ALWAYS:
+      1. Run recalculation (openpyxl: wb.calculation.calcMode = 'auto')
+      2. Reopen the file with data_only=True to verify computed values
+      3. Compare computed values against expected results
+  causal_evidence: "5/7 sprint-5 failures traced to stale formula values"
+  generalizability: "high"    # high | medium | low — analyst's assessment
+```
+
+### 8.4 Hierarchical Consolidation
+
+Patches from all analysts merge hierarchically into a unified skill update. The merge operator resolves conflicts and filters by prevalence.
+
+**Merge procedure**:
+
+1. **Batch patches** by target skill (e.g., all generator patches together, all evaluator patches together)
+2. **Deduplicate**: When multiple patches propose the same edit, keep the best-worded version
+3. **Resolve conflicts**: When patches propose contradictory edits, choose the one with stronger causal evidence or synthesize both
+4. **Filter by prevalence**: Patches that appear independently in multiple traces are treated as systematic patterns — they go into the main skill document. Patches from a single trace are treated as edge cases — they go into `references/`
+5. **Validate**: The merged patch must not introduce contradictions with existing skill content
+
+**Prevalence tiers**:
+
+| Prevalence | Threshold | Destination | Rationale |
+|---|---|---|---|
+| **High** | Appears in ≥30% of traces | Main skill document (SKILL.md or prompt .md) | Systematic property — always relevant |
+| **Medium** | Appears in 10-30% of traces | Skill document with conditional framing ("When X, do Y") | Situationally relevant |
+| **Low** | Appears in <10% of traces | `references/` subdirectory, linked from main skill | Edge case — don't clutter the main prompt |
+
+**Conflict resolution rules**:
+- When two patches target the same section with different advice, prefer the one backed by more failure traces (preventing bugs > encoding success patterns)
+- When a success patch contradicts a failure patch for the same behavior, the failure patch wins (conservative)
+- When patches are complementary (both correct but addressing different aspects), merge into a combined edit
+- Line-level independence: merged patches must not target overlapping text ranges
+
+### 8.5 Skill Versioning
+
+Every evolution cycle produces a new skill version. The changelog tracks what changed and why.
+
+```yaml
+# .harness/skills/changelog.yaml
+versions:
+  - version: "1.0.0"
+    date: "2026-03-15"
+    type: "initial"
+    description: "Human-authored generator prompt"
+
+  - version: "1.1.0"
+    date: "2026-03-20"
+    type: "evolution"
+    trigger: "After sprints 1-5 (3 failures, 2 successes)"
+    traces_analyzed: 5
+    patches_proposed: 12
+    patches_accepted: 7
+    patches_filtered: 5        # low prevalence → references/
+    changes:
+      - skill: ".harness/prompts/generator.md"
+        edit: "Added formula recalculation checklist"
+        prevalence: "high (4/5 traces)"
+        evidence: "Sprints 2,3,5 failed due to stale formula values"
+      - skill: ".harness/skills/references/datetime_handling.md"
+        edit: "New reference doc for timezone edge cases"
+        prevalence: "low (1/5 traces)"
+        evidence: "Sprint 4 success pattern — not yet validated across traces"
+    effectiveness:
+      pre_evolution_pass_rate: 0.40    # 2/5 sprints passed first attempt
+      post_evolution_pass_rate: null   # measured after next batch
+
+  - version: "1.2.0"
+    date: "2026-03-28"
+    type: "evolution"
+    trigger: "After sprints 6-10 (1 failure, 4 successes)"
+    effectiveness:
+      pre_evolution_pass_rate: 0.80    # 4/5 sprints passed first attempt
+      improvement_from_v1_0: "+40pp"
+```
+
+### 8.6 Evolution Triggers and Cadence
+
+| Trigger | When to Evolve | Scope |
+|---|---|---|
+| **Batch completion** | After every N sprints (default: 5) | Evolve all agent skills |
+| **Failure spike** | 3+ consecutive sprint failures | Evolve the failing agent's skill immediately |
+| **Evaluator miss** | Evaluator fails to catch an issue found in E2E or production | Evolve the evaluator skill |
+| **New capability area** | First sprint in a new `openspec/capabilities/<cap>/` | Check if existing skills generalize; evolve if not |
+| **Model change** | Switching to a new model version | Re-evaluate all skills — model strengths/weaknesses shift |
+
+**Cadence rules**:
+- Never evolve mid-sprint — evolution happens between sprints, not during
+- Always run at least 3 sprints before the first evolution cycle (need enough traces)
+- Track pre/post evolution pass rates to measure skill effectiveness
+- If a skill evolution *decreases* pass rate, revert to the prior version and investigate
+
+### 8.7 Skill Deepening vs. Skill Creation
+
+Two modes, following Trace2Skill's distinction:
+
+**Skill Deepening** (refining existing prompts):
+- Start with the current human-authored or previously-evolved prompt (𝒮ₙ)
+- Analyze traces from sprints that used 𝒮ₙ
+- Produce 𝒮ₙ₊₁ by applying consolidated patches
+- The prompt improves incrementally; the structure is preserved
+
+**Skill Creation** (bootstrapping new prompts from scratch):
+- When adding a new agent role or capability-specific prompt
+- Start with a parametric draft (ask the LLM to write a prompt from its general knowledge)
+- Run sprints using the draft
+- Evolve the draft using the same trace → patch → consolidate pipeline
+- The draft rapidly improves because the initial version is weak — evolution has more signal
+
+### 8.8 What Skills to Evolve
+
+Not everything should be evolved. The skill evolution loop targets:
+
+| Artifact | Evolve? | Rationale |
+|---|---|---|
+| `.harness/prompts/generator.md` | **Yes** | Most execution traces, highest impact on output quality |
+| `.harness/prompts/evaluator.md` | **Yes** | Evaluator effectiveness directly determines quality gate reliability |
+| `.harness/prompts/planner.md` | **Selectively** | Evolve when sprint decomposition consistently fails (stories too large, missing dependencies) |
+| `.harness/prompts/architect.md` | **Selectively** | Evolve when design decisions cause downstream implementation failures |
+| `.harness/prompts/discovery.md` | **Rarely** | Discovery is less structured; evolution signal is weak |
+| `.harness/prompts/design.md` | **Rarely** | UX guidance is project-specific; hard to generalize from traces |
+| Sprint contracts | **No** | Contracts are per-sprint, not long-lived |
+| Specs (REQ-*/SCENARIO-*) | **No** | Specs evolve through reconciliation (Phase 7), not trace analysis |
+
+### 8.9 Cross-Model Skill Transfer
+
+A key property from Trace2Skill: evolved skills are declarative and architecture-agnostic. Skills evolved by one model can be used by another.
+
+**When this matters**:
+- Switching from Opus to Sonnet for cost optimization — does the skill still work?
+- Upgrading to a new model version — does the skill need re-evolution?
+- Running different agents on different models (e.g., generator on Opus, evaluator on Sonnet)
+
+**Transfer protocol**:
+1. After evolving a skill on model A, run 3 validation sprints on model B using the evolved skill
+2. If pass rate holds (within 10pp), the skill transfers
+3. If pass rate drops significantly, run a model-specific evolution cycle on model B's traces
+4. Track which skills are model-specific vs. model-agnostic in the changelog
+
+### 8.10 Integration with Orchestration (Phase 6)
+
+The orchestrator's loop gains an evolution step:
+
+```
+ORCHESTRATE:
+  ...existing loop...
+  
+  AFTER every N sprints (configurable, default 5):
+    a. Collect traces from completed sprints since last evolution
+    b. Partition into 𝒯⁺ (passed first attempt) and 𝒯⁻ (failed or retried)
+    c. IF |𝒯⁻| >= 3 OR evolution_interval_reached:
+       i.   Launch parallel Error Analysts (one per 𝒯⁻ trace)
+       ii.  Launch parallel Success Analysts (one per 𝒯⁺ trace)
+       iii. Collect patch pool 𝒫
+       iv.  Run hierarchical consolidation: merge → deduplicate → filter by prevalence
+       v.   Apply consolidated patch to skill artifacts
+       vi.  Update .harness/skills/changelog.yaml
+       vii. Log evolution event in ops/changelog.md
+    d. Resume sprint loop with evolved skills
+```
+
+---
+
+## Phase 9: Refactor Execution Checklist
 
 ### BMAD + OpenSpec Bootstrap
 
@@ -1711,6 +2019,17 @@ Before ending a session:
 - [ ] Set no-regression rule: overall project coverage must not decrease sprint-over-sprint
 - [ ] Document coverage waiver process: how to document and approve exceptions for untestable requirements
 
+### Skill Evolution (Phase 8)
+
+- [ ] Create `.harness/skills/` directory with `SKILL.md`, `scripts/`, `references/`
+- [ ] Create `.harness/patches/` directory for intermediate patch artifacts
+- [ ] Write `.harness/prompts/skill-evolver.md` with error/success analyst instructions
+- [ ] Initialize `.harness/skills/changelog.yaml` with version 1.0.0 (initial human-authored prompts)
+- [ ] Configure evolution trigger in `.harness/config.yaml` (default: every 5 sprints)
+- [ ] Configure failure spike threshold (default: 3 consecutive failures → immediate evolution)
+- [ ] Set prevalence thresholds for patch filtering (high ≥30%, medium 10-30%, low <10%)
+- [ ] Establish pre/post evolution pass rate tracking in `ops/metrics.md`
+
 ### Operational Tracking
 
 - [ ] Create `ops/status.md`, `ops/changelog.md`, `ops/known-issues.md`
@@ -1720,9 +2039,9 @@ Before ending a session:
 
 ---
 
-## Phase 9: Continuous Harness Evolution
+## Phase 10: Continuous Harness Evolution
 
-### 9.1 Stress-Test Assumptions
+### 10.1 Stress-Test Assumptions
 
 Every harness component encodes an assumption about what the model cannot do alone. Periodically test each of the 7 BMAD roles:
 
@@ -1744,7 +2063,7 @@ Also test structural assumptions:
 
 If removing a component degrades quality, it is **load-bearing**. If quality is unchanged, remove it.
 
-### 9.2 Load-Bearing Components (Empirically Validated)
+### 10.2 Load-Bearing Components (Empirically Validated)
 
 These remain load-bearing even with the most capable models:
 
@@ -1761,13 +2080,13 @@ Components that are conditionally load-bearing (test per project):
 8. **Architect (Winston)**: Load-bearing when introducing new capabilities. Often removable for stories within stable existing architecture.
 9. **Design (Sally)**: Load-bearing for user-facing work. Always removable for backend-only changes.
 
-### 9.3 Evolution Strategy
+### 10.3 Evolution Strategy
 
-1. Experiment with current models on realistic problems
-2. Read execution traces (handoffs, evaluations) to find failure patterns
-3. Tune agent prompts and evaluation criteria to address observed failures
-4. When a new model releases, re-examine each harness component
-5. Remove non-load-bearing components, add new ones for newly possible capabilities
+1. **Automated skill evolution (Phase 8)**: Run the Trace2Skill loop after every N sprints — parallel analysts extract lessons from traces, hierarchical consolidation merges them into prompt refinements, prevalence filtering separates systematic patterns from edge cases
+2. **Manual harness tuning**: When automated evolution plateaus (pass rate stable for 3+ cycles), examine whether the bottleneck is in the harness structure rather than prompt content
+3. **Model-triggered re-evaluation**: When a new model releases, re-examine each harness component — a more capable model may render some prompt guidance unnecessary while enabling new patterns
+4. **Component stress testing (10.1)**: Periodically test whether each BMAD role is still load-bearing
+5. **Skill transfer validation (8.9)**: When switching models, validate evolved skills still transfer
 6. Update `_bmad/architecture.md` when the harness architecture changes
 
 ---
@@ -1808,6 +2127,9 @@ For projects that don't need the full BMAD ceremony:
 | E2E tests only at the end | Integration bugs compound across sprints; late discovery = expensive rework | E2E per sprint, not just final evaluation |
 | No negative tests | Happy path tested, error paths assumed to work | Every SCENARIO-* that specifies error behavior must have a negative test |
 | Mocking at integration boundaries | Mocks can diverge from real behavior; prior incidents where mocked tests pass but production fails | Integration tests use real dependencies (DB, services); mocks only in unit tests for external deps |
+| Static agent prompts that never improve | Same prompt failures repeat across sprints; evaluator catches the same classes of issues repeatedly | Trace2Skill evolution loop: analyze traces, extract patches, consolidate into evolved prompts (Phase 8) |
+| Sequential trace analysis (one at a time) | Overfits to individual trajectory quirks; misses systematic patterns | Parallel independent analysts + prevalence-weighted consolidation (high-prevalence → prompt, low → references/) |
+| Evolving prompts without measuring effectiveness | No way to know if evolution helped or hurt | Track pre/post evolution pass rates; revert if pass rate decreases |
 
 ---
 
