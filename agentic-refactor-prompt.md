@@ -744,28 +744,33 @@ Measured by the traceability matrix in `_bmad/traceability.md`:
 
 **Spec coverage metric**: `(REQ-* with Test Status "Covered") / (REQ-* with Impl Status "Implemented")`. This must be 100% — every implemented requirement must have a test.
 
-**Scenario coverage metric**: `(SCENARIO-* with passing tests) / (total SCENARIO-*)`. This is the primary quality signal. Target: 100% for critical scenarios, 90%+ for all scenarios.
+**Scenario coverage metric**: `(SCENARIO-* with passing tests) / (total SCENARIO-*)`. This is the primary quality signal. Target: 100% for all scenarios — every scenario must have a passing test.
+
+**Reverse spec coverage metric**: `(tests referencing a REQ-* or SCENARIO-*) / (total tests)`. This must be 100% — every test must trace back to a spec requirement or scenario. Tests without spec references are orphan tests and are not permitted. This ensures spec coverage of all tests: no test exists without a corresponding specification anchor.
 
 #### Code Coverage (Secondary)
 
-Traditional line/branch coverage measured by the project's coverage tooling (e.g., `pytest-cov`, `c8`, `istanbul`, `gocov`). Code coverage is a safety net, not a goal:
+Traditional line/branch coverage measured by the project's coverage tooling (e.g., `pytest-cov`, `c8`, `istanbul`, `gocov`). Code coverage is a hard requirement, not a secondary signal:
 
-- **Minimum threshold**: 80% line coverage on new/modified files (configurable in `.harness/config.yaml`)
+- **100% line coverage**: All code paths must be exercised by tests — on all files, not just new/modified ones
+- **100% branch coverage**: All conditional branches must be exercised by tests
 - **No coverage regression**: Overall project coverage must not decrease sprint-over-sprint
-- **Uncovered code is a signal, not a crime**: If code coverage tools show uncovered paths, the evaluator checks whether those paths correspond to SCENARIO-* that should exist but don't — that's a spec gap, not just a test gap
+- **Uncovered code is a hard fail**: If code coverage tools show uncovered paths, the evaluator checks whether those paths correspond to SCENARIO-* that should exist but don't — that's a spec gap that must be closed before the sprint passes
 
 ```yaml
 # .harness/config.yaml addition
 coverage:
   spec_coverage:
     req_implemented_must_be_tested: true    # hard gate
-    scenario_pass_rate_threshold: 0.90       # 90% of SCENARIO-* must pass
+    scenario_pass_rate_threshold: 1.00       # 100% of all SCENARIO-* must pass
     critical_scenario_pass_rate: 1.00        # 100% of critical SCENARIO-* must pass
+    all_tests_must_reference_spec: true      # hard gate — no orphan tests allowed
+    orphan_test_threshold: 0                 # every test must trace to REQ-* or SCENARIO-*
 
   code_coverage:
     tool: "pytest-cov" | "c8" | "istanbul" | "gocov" | custom
-    minimum_line_coverage_new_files: 0.80    # 80% on new/modified files
-    minimum_branch_coverage_new_files: 0.70  # 70% branch coverage on new files
+    minimum_line_coverage: 1.00              # 100% line coverage on all files
+    minimum_branch_coverage: 1.00            # 100% branch coverage on all files
     no_regression: true                       # overall coverage must not decrease
     report_path: "coverage/"
     fail_sprint_on_violation: true            # coverage violation = sprint failure
@@ -805,10 +810,9 @@ The generator writes tests as part of implementation, following TDD discipline:
         scenario_id: "SCENARIO-AUTH-003"
         reason: "refresh endpoint returns 500 — likely missing migration"
     coverage:
-      line_coverage: 0.84
-      branch_coverage: 0.72
-      new_file_coverage: 0.91
-      coverage_delta: "+2.3%"  # vs. prior sprint
+      line_coverage: 1.00
+      branch_coverage: 1.00
+      coverage_delta: "+0.0%"  # vs. prior sprint
     spec_coverage:
       reqs_implemented: 5
       reqs_tested: 5
@@ -886,10 +890,10 @@ The evaluator does NOT trust the generator's self-reported test results. Quinn i
           issue: "assertion-spec mismatch: test asserts status == 200, but spec says 'SHALL return a JWT token with sub, exp, and iat claims' — status code is necessary but not sufficient"
 
     code_coverage:
-      line_coverage: 0.83     # evaluator's independent measurement
-      branch_coverage: 0.71
-      generator_claimed_line: 0.84
-      discrepancy: "1% delta — within tolerance"
+      line_coverage: 1.00     # evaluator's independent measurement
+      branch_coverage: 1.00
+      generator_claimed_line: 1.00
+      discrepancy: "0% delta — no discrepancy"
       threshold_violations: []
 
     e2e_results:
@@ -918,7 +922,9 @@ The generator MUST run tests and coverage before writing its handoff artifact. I
 |---|---|---|
 | All unit tests pass | 100% | Fix or document in handoff as blocker |
 | All integration tests pass | 100% | Fix or document in handoff as blocker |
-| New file line coverage | >= 80% | Write additional tests or document rationale for waiver |
+| Line coverage (all files) | 100% | Write additional tests — no waivers permitted |
+| Branch coverage (all files) | 100% | Write additional tests — no waivers permitted |
+| All tests reference REQ-*/SCENARIO-* | 100% | Add spec references to orphan tests or remove them |
 | No coverage regression | >= 0% delta | Identify removed tests or refactored code and restore coverage |
 
 #### Gate 2: Evaluator Verification (after generator handoff)
@@ -929,8 +935,10 @@ The evaluator independently runs all checks and adds its own. Failure here means
 |---|---|---|
 | All tests pass (clean run) | 100% | Sprint fails — critique sent to generator retry |
 | Spec coverage: implemented REQ-* with tests | 100% | Sprint fails — "REQ-X-NNN has no test" in critique |
-| Scenario pass rate | >= 90% (100% for critical) | Sprint fails if critical; warning if non-critical |
-| Code coverage on new files | >= 80% line, >= 70% branch | Sprint fails — "files X, Y below threshold" in critique |
+| Scenario pass rate | 100% (all scenarios) | Sprint fails — "SCENARIO-X-NNN failing" in critique |
+| Line coverage (all files) | 100% | Sprint fails — "files X, Y below 100% line coverage" in critique |
+| Branch coverage (all files) | 100% | Sprint fails — "files X, Y below 100% branch coverage" in critique |
+| All tests reference REQ-*/SCENARIO-* | 100% | Sprint fails — "orphan tests: test_X, test_Y have no spec reference" in critique |
 | No phantom coverage | 0 instances | Sprint fails — "test for REQ-X-NNN doesn't exercise the requirement" |
 | No assertion-spec mismatches (critical) | 0 instances | Sprint fails — "test for REQ-X-NNN asserts status code but spec requires schema validation" |
 | No assertion-spec mismatches (partial) | 0 instances | Warning — noted in critique, hard fail deferred to Gate 3 |
@@ -948,7 +956,7 @@ Full regression and cross-story integration testing:
 |---|---|---|
 | Full SCENARIO-* regression suite | 100% pass | Escalate to user — regression introduced between sprints |
 | Cross-story E2E scenarios | 100% pass | Escalate to user — integration gap between stories |
-| Overall project code coverage | No regression from pre-refactor baseline | Warning — coverage decreased, investigate which REQ-* lost tests |
+| Overall project code coverage | 100% line + 100% branch | Hard fail — all code must be covered by tests |
 | Traceability matrix consistency | All "Implemented" REQ-* show "Covered" | Hard fail — traceability out of sync, reconcile before done |
 | Assertion-spec mismatches (partial) | 0 remaining | Hard fail — all partial mismatches from Gate 2 must be resolved by final evaluation |
 | Contract test coverage | All API boundaries have contracts | Hard fail — uncontracted boundaries risk silent breakage |
@@ -1425,8 +1433,8 @@ fi
 
 # Check coverage thresholds
 COVERAGE=$(make coverage-report 2>/dev/null | grep "Total" | awk '{print $NF}' | tr -d '%')
-if [ "${COVERAGE:-0}" -lt 80 ]; then
-    echo "Task completion rejected: code coverage ${COVERAGE}% is below 80% threshold" >&2
+if [ "${COVERAGE:-0}" -lt 100 ]; then
+    echo "Task completion rejected: code coverage ${COVERAGE}% is below 100% threshold" >&2
     exit 2
 fi
 
@@ -2011,13 +2019,14 @@ ORCHESTRATE:
 - [ ] Configure Gate 2 (evaluator verification): independent test run + spec coverage audit + test quality check + assertion-spec audit + contract tests + conformance fixtures + E2E
 - [ ] Configure Gate 3 (final evaluation): full regression + cross-story E2E + traceability consistency + all partial assertion mismatches resolved + contract coverage complete
 - [ ] Set hard-fail threshold: spec coverage = 100% of implemented REQ-* must be tested
-- [ ] Set hard-fail threshold: critical SCENARIO-* pass rate = 100%
+- [ ] Set hard-fail threshold: all SCENARIO-* pass rate = 100%
+- [ ] Set hard-fail threshold: reverse spec coverage = 100% — every test must reference a REQ-* or SCENARIO-*
 - [ ] Set hard-fail threshold: assertion-spec critical mismatches = 0
 - [ ] Set hard-fail threshold: contract test pass rate = 100% (when contracts exist)
 - [ ] Set hard-fail threshold: conformance fixtures = 100% golden pass + 100% poison detection (when applicable)
-- [ ] Set configurable threshold: code coverage on new files (default 80% line, 70% branch)
+- [ ] Set hard-fail threshold: 100% line coverage on all files — no exceptions
+- [ ] Set hard-fail threshold: 100% branch coverage on all files — no exceptions
 - [ ] Set no-regression rule: overall project coverage must not decrease sprint-over-sprint
-- [ ] Document coverage waiver process: how to document and approve exceptions for untestable requirements
 
 ### Skill Evolution (Phase 8)
 
@@ -2118,7 +2127,7 @@ For projects that don't need the full BMAD ceremony:
 | Tests without REQ-* references | No traceability; can't verify coverage | Every test references the SCENARIO-* it verifies |
 | Handoffs without spec references | Next agent can't verify what was actually completed | Handoffs list implemented REQ-* with verification evidence |
 | Trusting generator's self-reported test results | Generator may have test pollution, cached results, or order-dependent tests | Evaluator runs full suite independently from clean state |
-| Code coverage as the only metric | 100% line coverage with trivial assertions proves nothing | Spec coverage (REQ-* tested) is primary; code coverage is secondary safety net |
+| Code coverage as the only metric | 100% line coverage with trivial assertions proves nothing | Both spec coverage and code coverage are required at 100%; spec coverage ensures tests are meaningful, code coverage ensures no code is untested |
 | Tests that reference REQ-* but don't exercise it | Phantom coverage — traceability looks complete but requirements are unverified | Evaluator audits test bodies against requirement descriptions, flags phantom coverage |
 | Tests that cite REQ-* but assert the wrong thing | Assertion-spec mismatch — test passes but doesn't verify what the spec requires (e.g., checking status 200 when spec mandates schema conformance) | Assertion-to-spec traceability audit compares test assertions against actual spec text (Section 5.9) |
 | No API contract tests between components | Backend changes response shape, frontend breaks silently; caught late by E2E with poor diagnostics | Contract tests validate shared API schemas from both producer and consumer sides (Section 5.8) |
