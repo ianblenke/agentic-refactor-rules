@@ -31,6 +31,7 @@ CLAUDE.md                     # Instructions for Claude Code sessions working in
 
 | Phase | What It Does |
 |-------|-------------|
+| **Claude Code Adaptation** | Mitigate Claude Code's system prompt priority architecture: hooks for deterministic enforcement, path-scoped rules, lean CLAUDE.md, extended thinking, task-scoped role framing |
 | **Phase 1** | Analyze the existing project, bootstrap BMAD docs and OpenSpec capability specs |
 | **Phase 2** | Decompose into 7 BMAD agent roles (Discovery, Planner, Architect, Design, Generator, Evaluator, Orchestrator) |
 | **Phase 3** | Define sprint contracts with measurable acceptance criteria linked to REQ-* and SCENARIO-* |
@@ -228,6 +229,7 @@ See Phase 9 of the prompt for the full stress-test table across all 7 BMAD roles
 - [OpenSpec](https://github.com/Fission-AI/OpenSpec) -- Spec-Driven Development for AI Coding Assistants
 - [Making Your Agents Built Using Claude Agent SDK Run Faster](https://medium.com/@bayllama/making-your-agents-built-using-claude-agent-sdk-run-faster-2f2526a5cb42) -- Agent SDK performance optimizations
 - [Claude Code Agent Teams](https://code.claude.com/docs/en/agent-teams) -- Multi-agent coordination in Claude Code
+- [Why Claude Code Overrides Your CLAUDE.md: A Technical Deep Dive](https://claude.ai/code) -- Analysis of Claude Code's system prompt priority architecture and why BMAD/OpenSpec instructions in CLAUDE.md are structurally subordinate. Informs the "Claude Code Harness Adaptation" section of the refactor prompt.
 
 ## License
 

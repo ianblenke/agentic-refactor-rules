@@ -43,7 +43,9 @@ The harness maps BMAD's virtual team roles to discrete agent contexts with full 
 | UX Designer (Sally) | **Design Agent** (optional) | Fresh per design task | `_bmad/ux-spec.md`, design tokens |
 | Skill Evolver (Trace2Skill) | **Skill Evolution Agent** | Fresh per evolution cycle | `.harness/skills/`, `.harness/patches/` |
 
-**Critical rule**: No two BMAD roles share a context window. The orchestrator is a stateless script, not an LLM — it reads handoff files and launches the next agent.
+**Critical rules**:
+- No two BMAD roles share a context window. The orchestrator is a stateless script, not an LLM — it reads handoff files and launches the next agent.
+- **Do not ask Claude to adopt BMAD personas by name.** Claude Code's hardcoded identity ("I am Claude Code") is a hard constraint that overrides external persona assignments. Instead, frame each role as a **task scope**: "Your task is architecture review. Focus exclusively on design decisions and ADRs. Do NOT write implementation code." The functional constraint achieves role separation without triggering the identity override. See "Claude Code Harness Adaptation" section for details.
 
 ---
 
@@ -104,6 +106,13 @@ project-root/
     patches/                          # Trajectory-specific patches (intermediate artifacts)
       patch-sprint-<N>.yaml           # Per-sprint skill patches before consolidation
 
+  .claude/                              # Claude Code harness adaptation layer
+    rules/                            # Path-scoped rules (injected as fresh system-reminders)
+      openspec.yaml                   # "Validate against spec before generating code for openspec/"
+      src.yaml                        # "Read sprint contract and spec before modifying src/"
+      tests.yaml                      # "Every test must reference REQ-* or SCENARIO-*"
+      harness.yaml                    # "Never modify .harness/ files during generation sprints"
+
   ops/                                # Operational tracking
     status.md                         # What's working, what's next (session handoff doc)
     changelog.md                      # What was done, traceable to user instructions
@@ -116,7 +125,316 @@ project-root/
   scripts/
     orchestrate.py                    # Harness orchestration loop
     session-metrics.py                # Token cost extraction
+    validate-phase-gate.sh            # Hook script: enforce phase gates deterministically
+    validate-task-completion.sh       # Hook script: reject task completion if tests fail
 ```
+
+---
+
+## Claude Code Harness Adaptation
+
+> **Why this section exists**: Claude Code's architecture is deliberately engineered to prioritize its hardcoded system prompt over user-supplied `CLAUDE.md` instructions. BMAD and OpenSpec workflows depend on behavioral rules (phase discipline, spec-first development, role separation) that compete for attention with ~50 pre-existing system prompt directives. Understanding the failure modes — and routing critical constraints through deterministic enforcement mechanisms instead of probabilistic `CLAUDE.md` instructions — is essential for making spec-driven agentic workflows reliable.
+
+### The Instruction Priority Problem
+
+Claude Code assembles a three-layer API request:
+
+```
+{
+  "system": [ ... ],      // Static, cached system prompt: ~2,300-3,600 tokens
+  "tools": [ ... ],       // Tool definitions: 14,000-17,600 tokens
+  "messages": [ ... ]     // Conversation history + system-reminders
+}
+```
+
+Your `CLAUDE.md` is **not** part of the `system` block. It is injected into the `messages` array as a `<system-reminder>` XML tag attached to each user turn. The model's trained attention weighting treats `system` as authoritative and `messages` as potentially adversarial (to prevent prompt injection). This means:
+
+1. **Structural subordination**: `CLAUDE.md` content occupies a lower-priority position than the hardcoded system prompt
+2. **"May or may not be relevant" qualifier**: The harness wraps `CLAUDE.md` with language granting Claude permission to disregard it: *"this context may or may not be relevant to your tasks"*
+3. **Instruction budget exhaustion**: The system prompt already contains ~50 behavioral directives, consuming 25-33% of Claude's reliable instruction-following capacity (~150-200 instructions) before `CLAUDE.md` is even read
+4. **Positional bias**: `CLAUDE.md` sits in the middle of the messages array — a lower-attention zone between the high-attention peripheries (system prompt at the start, most recent user message at the end)
+5. **Tool definition dilution**: 14,000-17,600 tokens of tool JSON schemas sit between the system prompt and your `CLAUDE.md`, further reducing attention
+6. **37 dynamic system reminders**: Claude Code injects reactive `<system-reminder>` messages mid-conversation (token budget warnings, context compaction notices, task tool nudges). These carry the same trust level as `CLAUDE.md` but appear more recently in the message history, systematically outcompeting methodology instructions from turn 1
+7. **Conciseness directive**: External users receive "IMPORTANT: Go straight to the point. Try the simplest approach first. Be extra concise." — actively hostile to the extended, multi-phase reasoning BMAD and OpenSpec require
+
+### Specific Failure Modes for BMAD/OpenSpec
+
+| Failure Mode | Mechanism | Impact |
+|---|---|---|
+| **Role adoption refusal** | Claude's identity is hardcoded: "I am Claude Code, Anthropic's official CLI" — treated as a hard constraint, not a soft preference | Agent refuses to adopt BMAD personas (Product Manager, Architect, etc.) defined in slash commands or prompts |
+| **Phase skipping** | "Go straight to the point" + "lead with action, not reasoning" push Claude to skip research/design phases and generate code immediately | Discovery, Planning, and Architecture phases get collapsed into direct implementation |
+| **Spec fidelity drift** | Context rot in long sessions causes divergence from specs established in earlier turns | Implementation drifts from OpenSpec requirements over multi-turn sessions |
+| **Plan-before-code suppression** | "Lead with action, not reasoning" actively suppresses the deliberate planning phase BMAD requires | Generator starts implementing before fully reading sprint contracts |
+| **Methodology instruction decay** | Dynamic system reminders injected at turn 50 outcompete BMAD methodology instructions from turn 1 | Spec-anchored discipline degrades as conversations grow |
+
+### Mitigation Strategies
+
+The following strategies move critical behavioral constraints out of the probabilistic `CLAUDE.md` channel and into deterministic enforcement mechanisms.
+
+#### 1. Use Hooks for Behavioral Rules (Deterministic Enforcement)
+
+`CLAUDE.md` instructions are probabilistic — the model chooses whether to follow them. Hooks (`PreToolUse`, `PostToolUse`, `SessionStart`) are **deterministic** — the harness executes them regardless of model state. Phase enforcement logic belongs in hooks, not `CLAUDE.md`.
+
+```json
+// settings.json (project-level: .claude/settings.json)
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Write|Edit",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "scripts/validate-phase-gate.sh",
+            "description": "Block code generation if spec file doesn't exist for the capability being modified"
+          }
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Bash",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "scripts/validate-test-run.sh",
+            "description": "After test execution, verify coverage thresholds are met"
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+**`scripts/validate-phase-gate.sh`** (exit code 2 = block with feedback):
+
+```bash
+#!/bin/bash
+# Enforce spec-first development: block code writes if no spec exists
+# for the capability being modified.
+# Called by PreToolUse hook on Write|Edit.
+
+FILE_PATH="$1"  # The file being written/edited
+
+# Extract capability from file path (e.g., src/auth/login.py -> auth)
+CAP=$(echo "$FILE_PATH" | sed -n 's|.*src/\([^/]*\)/.*|\1|p')
+
+if [ -z "$CAP" ]; then
+    exit 0  # Not a src/ file — allow
+fi
+
+SPEC="openspec/capabilities/$CAP/spec.md"
+if [ ! -f "$SPEC" ]; then
+    echo "BLOCKED: No spec found at $SPEC. Create the OpenSpec capability spec before implementing code for '$CAP'. See Phase 1.2 of the refactor guide." >&2
+    exit 2
+fi
+
+# Check that at least one REQ-* exists in the spec
+if ! grep -q 'REQ-' "$SPEC"; then
+    echo "BLOCKED: Spec at $SPEC contains no REQ-* identifiers. Add requirements before implementing." >&2
+    exit 2
+fi
+
+exit 0
+```
+
+**What belongs in hooks vs. CLAUDE.md:**
+
+| Constraint | Enforcement Channel | Why |
+|---|---|---|
+| "Don't write code without a spec" | **Hook** (PreToolUse on Write/Edit) | Must be deterministic — model will skip this under conciseness pressure |
+| "Run tests before handoff" | **Hook** (PostToolUse on Bash or TaskCompleted) | Must be deterministic — model may declare done without testing |
+| "Every test must reference REQ-*" | **Hook** (PostToolUse on Write for test files) | Can be validated by script — no model judgment needed |
+| "Read the sprint contract first" | **`.claude/rules/`** path-scoped rule | Injected fresh when touching `src/` — better than stale CLAUDE.md |
+| "Tech stack is Python 3.12 + FastAPI" | **CLAUDE.md** | Factual context — appropriate for probabilistic channel |
+| "Build command is `make build`" | **CLAUDE.md** | Factual context |
+| "Use Opus for implementation" | **Harness config** (`.harness/config.yaml`) | Orchestrator reads this, not the model |
+
+#### 2. Keep CLAUDE.md Lean (<300 Lines, Factual Only)
+
+`CLAUDE.md` should be a **session onboarding document**, not a methodology definition. Keep it under 300 lines focused exclusively on project-specific factual context: tech stack, directory structure, build commands, naming conventions.
+
+Move BMAD/OpenSpec methodology into:
+- **Hooks** for rules that must be enforced deterministically
+- **`.claude/rules/`** for path-scoped rules injected fresh when relevant
+- **`--append-system-prompt`** for critical workflow constraints that need system-prompt-level priority
+- **Referenced documents** (`.harness/prompts/*.md`, `openspec/AGENTS.md`) that Claude loads on demand via the Progressive Disclosure pattern — methodology lives in files the agent reads when needed, not in the always-loaded `CLAUDE.md`
+
+**CLAUDE.md template for refactored projects:**
+
+```markdown
+# CLAUDE.md
+
+## Project
+<1-2 sentence description>
+
+## Tech Stack
+<language, framework, key dependencies>
+
+## Build / Test / Deploy
+\`\`\`bash
+<build command>
+<test command>
+<lint command>
+<deploy command>
+\`\`\`
+
+## Directory Structure
+| Path | Contents |
+|------|----------|
+| _bmad/ | BMAD strategic docs (prd.md, architecture.md, traceability.md) |
+| openspec/ | OpenSpec capability specs — READ BEFORE MODIFYING CODE |
+| .harness/ | Agent prompts, handoffs, contracts, evaluations |
+| ops/ | Status, changelog, metrics, test results |
+
+## Conventions
+<naming, formatting, patterns specific to this project>
+
+## Key Commands
+<frequently used commands>
+
+## When to Read Deeper
+- Before modifying any capability: read `openspec/capabilities/<cap>/spec.md`
+- Before architectural decisions: read `_bmad/architecture.md`
+- Before starting a sprint: read the sprint contract in `.harness/contracts/`
+- Before reporting done: read `ops/e2e-test-plan.md` and run E2E tests
+```
+
+#### 3. Use `.claude/rules/` for Path-Scoped Reminders
+
+The `.claude/rules/` directory supports YAML files with `paths:` frontmatter. These rules are injected as fresh `<system-reminder>` messages when Claude touches relevant files — arriving at the **current** turn rather than stale from session start. This gives them recency advantage over `CLAUDE.md`.
+
+```yaml
+# .claude/rules/openspec.yaml
+---
+paths:
+  - "openspec/**"
+---
+You are modifying OpenSpec specification files. These are the source of truth
+for all requirements. Before editing:
+1. Read the existing REQ-* and SCENARIO-* identifiers
+2. Assign new REQ-*/SCENARIO-* IDs following the existing numbering scheme
+3. Use Given/When/Then BDD format for all SCENARIO-* definitions
+4. After editing, update _bmad/traceability.md to reflect changes
+```
+
+```yaml
+# .claude/rules/src.yaml
+---
+paths:
+  - "src/**"
+---
+Before modifying source code:
+1. Read the sprint contract in .harness/contracts/ for this story
+2. Read the relevant openspec/capabilities/<cap>/spec.md
+3. Write or update tests FIRST — each test must reference REQ-* or SCENARIO-*
+4. Implement code to make tests pass
+5. Run the full test suite before declaring done
+Think carefully about how this code satisfies the spec requirements.
+```
+
+```yaml
+# .claude/rules/tests.yaml
+---
+paths:
+  - "tests/**"
+---
+Every test file MUST include a traceability header:
+# Tests for: openspec/capabilities/<cap>/spec.md
+# REQ-<CAP>-NNN: <description>
+# SCENARIO-<CAP>-NNN: <description>
+
+Every test function must reference at least one REQ-* or SCENARIO-*.
+Tests without spec references are orphans and must be linked or removed.
+Think harder about whether test assertions actually match what the spec requires.
+```
+
+```yaml
+# .claude/rules/harness.yaml
+---
+paths:
+  - ".harness/**"
+---
+Harness artifacts (.harness/) are managed by the orchestrator and skill
+evolution pipeline. During generation sprints, do NOT modify:
+- .harness/prompts/ (evolved by Trace2Skill)
+- .harness/config.yaml (managed by orchestrator)
+- .harness/evaluations/ (written by evaluator only)
+You MAY write to:
+- .harness/handoffs/ (your handoff artifact)
+```
+
+#### 4. Use `--append-system-prompt` for High-Priority Methodology Flags
+
+The `--append-system-prompt` flag injects text directly above the tool definitions in the system prompt — substantially better placement than a `<system-reminder>` in the messages array. Critical workflow constraints that must be universally respected belong here.
+
+```bash
+claude --append-system-prompt "$(cat <<'EOF'
+WORKFLOW RULES (override default behavior):
+- This project uses spec-anchored development. NEVER write implementation code
+  without first reading the relevant openspec/capabilities/<cap>/spec.md.
+- NEVER evaluate your own output quality. The evaluator agent handles QA.
+- When working on a story, read the sprint contract FIRST.
+- Write tests BEFORE implementation code. Tests must reference REQ-* identifiers.
+- Use 'think harder' when analyzing specs or designing implementations.
+EOF
+)"
+```
+
+**Note**: This adds per-session overhead (not cacheable). Use sparingly for the 3-5 most critical constraints that the model most often violates.
+
+#### 5. Explicitly Counteract the Conciseness Directive
+
+The external user build actively suppresses reasoning with "Go straight to the point. Be extra concise." This is directly hostile to BMAD's multi-phase, deliberate reasoning requirements. Counteract by explicitly invoking extended thinking:
+
+- Use `think` (4K token budget), `think harder` (10K tokens), or `ultrathink` (31,999 tokens) in phase-entry prompts
+- Include thinking invocations in agent prompts and sprint contracts:
+
+```markdown
+<!-- In .harness/prompts/generator.md -->
+Before writing any implementation code, think harder about:
+1. What REQ-* and SCENARIO-* does the sprint contract require?
+2. What tests need to exist before implementation begins?
+3. What design patterns from design.md apply?
+4. What edge cases does the spec define?
+```
+
+```markdown
+<!-- In .harness/prompts/evaluator.md -->
+Ultrathink about whether each test actually verifies what the spec requires.
+Do not accept tests that merely check status codes when the spec mandates
+schema validation or specific response content.
+```
+
+#### 6. Manage Context Window as a First-Class Concern
+
+Context window degradation is not theoretical — quality noticeably degrades at ~147,000-152,000 tokens even in a 200K window. BMAD workflows that span many turns are particularly vulnerable because methodology instructions from early turns lose influence.
+
+**Practices:**
+- **Rotate sessions at phase boundaries**: Research → Design → Spec → Generation should each be a fresh session, not one marathon conversation. This is already the design of the harness (context resets between agents), but it must also apply when working interactively in Claude Code.
+- **Monitor token usage**: Use `/context` to check usage. If approaching 65% capacity, write a handoff and start a fresh session.
+- **Never rely on compaction to preserve methodology**: Context compaction summarizes away the spec details and methodology instructions that BMAD depends on. Prefer a context reset with a structured handoff over compaction.
+- **Front-load critical context**: When starting a fresh session, load the sprint contract and relevant specs in the first message — they'll benefit from the high-attention position at the start of the conversation.
+
+#### 7. Role Framing Without Identity Override
+
+Claude resists adopting BMAD personas because its identity ("I am Claude Code") is a hard constraint. Instead of asking Claude to "become" a persona, frame roles as **task scoping with expertise emphasis**:
+
+**Don't:**
+```
+You are Winston, the Architect agent. Your role is to make design decisions...
+```
+
+**Do:**
+```
+Your task is architecture review. Focus exclusively on design decisions,
+ADRs, and technical pattern selection. Do NOT write implementation code.
+Read the change proposal and produce updated design.md files.
+Think harder about tradeoffs between approaches.
+```
+
+The functional constraint ("focus on design, don't implement") achieves role separation without triggering the identity override. The agent's behavior is scoped by what it's asked to do and what tools it has access to, not by what persona it claims to be.
 
 ---
 
@@ -2039,6 +2357,18 @@ ORCHESTRATE:
 - [ ] Set prevalence thresholds for patch filtering (high ≥30%, medium 10-30%, low <10%)
 - [ ] Establish pre/post evolution pass rate tracking in `ops/metrics.md`
 
+### Claude Code Harness Adaptation
+
+- [ ] Create `.claude/rules/` directory with path-scoped rules (`openspec.yaml`, `src.yaml`, `tests.yaml`, `harness.yaml`)
+- [ ] Create `.claude/settings.json` with hooks for phase gate enforcement (`PreToolUse` on Write/Edit) and task completion validation (`PostToolUse` on Bash)
+- [ ] Write `scripts/validate-phase-gate.sh` — blocks code writes when no spec exists for the capability
+- [ ] Trim `CLAUDE.md` to <300 lines — factual context only (tech stack, build commands, directory layout)
+- [ ] Move all methodology instructions out of `CLAUDE.md` into hooks, `.claude/rules/`, and referenced docs
+- [ ] Configure `--append-system-prompt` launch script or alias with the 3-5 most critical workflow constraints
+- [ ] Add `think harder` / `ultrathink` invocations to `.harness/prompts/generator.md` and `.harness/prompts/evaluator.md`
+- [ ] Frame all agent role prompts as task scoping ("Your task is architecture review") not persona adoption ("You are Winston the Architect")
+- [ ] Document context rotation boundaries in `ops/status.md` — each BMAD phase should be a separate session
+
 ### Operational Tracking
 
 - [ ] Create `ops/status.md`, `ops/changelog.md`, `ops/known-issues.md`
@@ -2139,6 +2469,12 @@ For projects that don't need the full BMAD ceremony:
 | Static agent prompts that never improve | Same prompt failures repeat across sprints; evaluator catches the same classes of issues repeatedly | Trace2Skill evolution loop: analyze traces, extract patches, consolidate into evolved prompts (Phase 8) |
 | Sequential trace analysis (one at a time) | Overfits to individual trajectory quirks; misses systematic patterns | Parallel independent analysts + prevalence-weighted consolidation (high-prevalence → prompt, low → references/) |
 | Evolving prompts without measuring effectiveness | No way to know if evolution helped or hurt | Track pre/post evolution pass rates; revert if pass rate decreases |
+| Putting methodology rules in CLAUDE.md | CLAUDE.md is injected as a `<system-reminder>` in the messages array — lower priority than the system prompt, diluted by 14K+ tokens of tool definitions, and explicitly qualified as "may or may not be relevant" | Move behavioral rules to hooks (deterministic), path-scoped `.claude/rules/` (fresh injection), and `--append-system-prompt` (system-level priority). Keep CLAUDE.md lean and factual. |
+| Long CLAUDE.md files (>300 lines) | Competes with ~50 existing system prompt instructions for a ~150-200 instruction budget; instruction-following degrades uniformly as count increases | Keep CLAUDE.md under 300 lines. Use Progressive Disclosure: methodology lives in referenced files the agent reads on demand |
+| Asking Claude to adopt BMAD personas | Claude's "I am Claude Code" identity is a hard constraint — it refuses external persona assignments | Frame roles as task scoping with expertise emphasis: "Your task is architecture review. Do NOT write implementation code." Scope behavior through tools and instructions, not persona |
+| Running BMAD phases in a single marathon session | Context degrades at ~147K-152K tokens; dynamic system reminders injected mid-conversation outcompete methodology instructions from turn 1 | Rotate sessions at phase boundaries. Each BMAD agent gets a fresh context window. Monitor with `/context`. |
+| Relying on CLAUDE.md for phase discipline | "Go straight to the point" in the system prompt pushes Claude to skip research/design phases and generate code immediately | Enforce phase gates in hooks (PreToolUse): script blocks Write/Edit if no spec exists for the capability |
+| Not using extended thinking keywords | External users receive a conciseness-maximized build that suppresses the multi-phase reasoning BMAD requires | Use `think`, `think harder`, or `ultrathink` in agent prompts and sprint contracts to allocate explicit thinking budgets |
 
 ---
 
