@@ -956,7 +956,47 @@ criterion:
 - **Weight lightly**: Code style, formatting, minor craft issues
 - **Hard-fail on**: Spec contradictions without rationale, broken builds, security issues, data loss
 
-### 4.3 Prompt Wording as Steering
+### 4.3 Simplicity as Tiebreaker
+
+When two implementations score equally on all weighted criteria, prefer the simpler one. Simplicity is not a weighted criterion — it is a **tiebreaker** applied after scoring.
+
+**Simplicity indicators** (in priority order):
+
+1. Fewer components / moving parts
+2. Less code for the same outcome
+3. Cleaner tool/API interfaces (fewer parameters, less ceremony)
+4. Less brittle logic (fewer conditional branches, less state)
+5. Fewer dependencies
+
+**When to apply**: The evaluator invokes the simplicity tiebreaker when:
+- Two retry attempts produce different solutions that both pass all criteria
+- A refactored version scores the same as the original
+- Autonomous mode's keep/discard decision encounters equal pass counts
+
+**When NOT to apply**: Simplicity never overrides a hard-fail condition or a weighted criterion score difference. A simpler solution that scores lower on spec fidelity loses to a more complex solution that scores higher.
+
+### 4.4 Failure Classification Taxonomy
+
+When the evaluator reports failures, classify each failure into one of these categories. This taxonomy makes evaluator reports more actionable and feeds better signal into Trace2Skill evolution (Phase 8).
+
+| Class | Description | Example | Typical Fix |
+|---|---|---|---|
+| **MISUNDERSTAND** | Agent misunderstood the task or requirement | Implemented search instead of filter | Clarify spec language, add examples to SCENARIO-* |
+| **MISSING_TOOL** | Agent lacked a tool needed for the task | No spreadsheet write tool, resorted to raw file I/O | Add specialized tool (see Appendix F) |
+| **WEAK_RESEARCH** | Agent didn't gather enough information before acting | Assumed DB schema without reading it | Strengthen discovery/research phase in prompt |
+| **BAD_STRATEGY** | Agent chose a poor execution approach | Rewrote entire module instead of patching | Add strategic guidance to generator prompt |
+| **MISSING_VERIFY** | Agent didn't verify its own output | Wrote code but never ran tests | Strengthen self-check step; enable verification sub-agent |
+| **ENV_DEPENDENCY** | Environment or dependency issue | Missing package, wrong runtime version | Fix environment setup; add to Dockerfile |
+| **SILENT_FAILURE** | Agent reported success but output is wrong | Tests pass but feature doesn't actually work (display-only) | Add E2E verification; tune evaluator skepticism |
+| **SPEC_DRIFT** | Implementation drifted from spec without rationale | Spec says "paginated list", code returns all results | Enforce spec reconciliation; add to hard-fail conditions |
+
+**Usage rules**:
+- Every evaluator failure report must include a `failure_class` field from this taxonomy
+- Trace2Skill analysts use failure classes to group patches — fix **classes** of failures, not individual tasks
+- If a failure doesn't fit any class, it's either a new class (propose it) or a compound failure (decompose it)
+- The autonomous mode's stop-on-repeated-failure (Phase 6.1 step 7) uses failure class equality, not failure description equality
+
+### 4.5 Prompt Wording as Steering
 
 The language in evaluation criteria directly steers generator behavior. Include the criteria in the generator's prompt — they guide implementation, not just evaluation:
 
@@ -1610,6 +1650,7 @@ LOOP until (all stories complete) OR (max_iterations reached):
         Reads: story + spec.md + design.md + ux-spec.md + contract + last handoff
         Process: write tests -> implement -> self-check -> commit -> handoff
         Produces: code, tests, updated spec status, handoff artifact
+        Optional: invoke VERIFICATION SUB-AGENT before handoff (see 6.3 generator.sub_agents)
 
      c. EVALUATOR AGENT — QA Quinn (fresh context):
         Reads: contract + story + spec.md + ux-spec.md + produced artifacts
@@ -1645,6 +1686,37 @@ LOOP until (all stories complete) OR (max_iterations reached):
      Update ops/changelog.md (what was done, traced to user instructions)
      Update ops/metrics.md (session metrics, token costs per agent)
      If implementation diverged from spec, update spec to match reality with rationale
+
+  7. AUTONOMOUS ITERATION MODE (optional, config-gated):
+     When harness.autonomous.enabled == true, the orchestrator runs unsupervised
+     after initial plan approval, iterating until interrupted or budget exhausted.
+
+     AUTONOMOUS LOOP (replaces human checkpoints in steps 0-6):
+       a. Execute steps 0-6 as normal (one full sprint cycle)
+       b. Record results in .harness/results.tsv:
+          commit | pass_rate | passed | failed | cost_usd | description
+       c. KEEP/DISCARD decision (deterministic, non-negotiable):
+          - KEEP if passed count improved over previous best
+          - KEEP if passed count equal BUT harness/code became simpler
+            (fewer files, fewer lines, cleaner interfaces — see simplicity criteria)
+          - OTHERWISE: git revert to previous best commit, log reason in results.tsv
+       d. IF autonomous.max_iterations reached OR autonomous.max_budget_usd exhausted:
+            Write summary to ops/status.md with best commit hash and final metrics
+            EXIT
+       e. ELSE: GOTO step 0 (next sprint cycle with evolved context from reconciliation)
+
+     NEVER STOP rules (when autonomous mode is active):
+       - Do NOT pause to ask the user whether to continue
+       - Do NOT stop after a single failure — diagnose, discard, iterate
+       - Do stop on: budget exhaustion, max iterations, 3 consecutive identical failures
+         (same failure class repeating = structural issue requiring human input)
+
+     Safety rails:
+       - Requires explicit user opt-in (autonomous.enabled: true in config)
+       - Initial plan (step 1 output) always requires human approval before autonomous execution begins
+       - All changes are committed with revert points — no destructive operations
+       - Budget cap is a hard ceiling, not a suggestion
+       - ops/status.md is updated every iteration so the user can monitor asynchronously
 ```
 
 ### 6.2 Alternative: Claude Code Agent Teams as Orchestrator
@@ -1798,6 +1870,46 @@ harness:
     contracts: ".harness/contracts/"
     evaluations: ".harness/evaluations/"
     prompts: ".harness/prompts/"
+    results: ".harness/results.tsv"       # autonomous mode run ledger
+
+  # ── Autonomous Iteration Mode ────────────────────────────────────
+  #
+  # When enabled, the orchestrator runs unsupervised after initial plan
+  # approval, iterating sprint cycles and keeping/discarding changes
+  # based on metric improvement (hill-climbing optimization).
+  #
+  # Inspired by AutoAgent's autonomous meta-agent loop.
+
+  autonomous:
+    enabled: false                         # opt-in only — requires explicit user activation
+    max_iterations: 20                     # hard cap on sprint cycles before stopping
+    max_budget_usd: 200.00                 # hard cost ceiling across all iterations
+    require_plan_approval: true            # human must approve initial plan before autonomous loop begins
+    stop_on_repeated_failure: 3            # halt after N consecutive identical failure classes
+    results_ledger: ".harness/results.tsv" # commit | pass_rate | passed | failed | cost_usd | status | description
+    simplicity_tiebreaker: true            # when pass count is equal, prefer simpler solutions
+
+  # ── Section Boundary Convention ────────────────────────────────────
+  #
+  # Harness files (agent prompts, orchestration scripts, config) use
+  # explicit section markers to separate code that is safe for automated
+  # evolution (Trace2Skill, autonomous mode) from structural infrastructure
+  # that must remain stable.
+  #
+  # In .harness/prompts/*.md and scripts/:
+  #   # === EDITABLE SECTION === (start)
+  #   # === END EDITABLE SECTION === (end)
+  #     → Trace2Skill patches, autonomous mode edits, and meta-agent
+  #       modifications target ONLY content within editable sections.
+  #
+  #   # === FIXED BOUNDARY === (start)
+  #   # === END FIXED BOUNDARY === (end)
+  #     → Infrastructure code (harness adapter, handoff serialization,
+  #       tool definitions). NEVER modified by automated processes.
+  #       Only changed by explicit human instruction.
+  #
+  # This prevents automated evolution from accidentally breaking the
+  # orchestration infrastructure while optimizing agent behavior.
 
   # ── Agent Definitions ──────────────────────────────────────────────
   #
@@ -1896,6 +2008,37 @@ harness:
       max_session_duration: "2h"
       reads: ["openspec/", "epics/stories/", "_bmad/ux-spec.md", ".harness/contracts/", ".harness/handoffs/"]
       writes: ["src/", "tests/", "openspec/capabilities/*/spec.md", ".harness/handoffs/"]
+      sub_agents:
+        # ── Verification Sub-Agent (agent-as-tool pattern) ───────────
+        #
+        # Lightweight in-flight sanity check the generator can invoke before
+        # handing off to the full evaluator. Catches obvious issues early,
+        # reducing expensive evaluator round-trips.
+        #
+        # This is NOT a replacement for the independent evaluator (Quinn) —
+        # it runs within the generator's context and only catches surface-level
+        # issues (tests pass, spec references present, no build errors).
+        #
+        # Inspired by AutoAgent's agent.as_tool() verification pattern.
+        verifier:
+          model: "claude-sonnet-4-6"   # lightweight — just a sanity check
+          mode: "auto"
+          effort: "low"
+          max_turns: 10
+          max_budget_usd: 1.00
+          tools: ["Read", "Grep", "Glob", "Bash"]  # read-only + test runner
+          tool_annotations:
+            Read: { readOnlyHint: true }
+            Grep: { readOnlyHint: true }
+            Glob: { readOnlyHint: true }
+          prompt_template: |
+            You are a pre-submission verifier. Check this sprint's work:
+            1. Run the test suite — do all tests pass?
+            2. Check that every new test file has REQ-*/SCENARIO-* traceability headers
+            3. Verify the build succeeds with no errors
+            4. Verify no obvious spec contradictions (compare implementation against contract)
+            Report PASS (with any warnings) or FAIL (with specific issues to fix).
+            Do NOT evaluate code quality, design decisions, or edge cases — that's the evaluator's job.
 
     evaluator:                        # BMAD: QA Quinn
       model: "claude-opus-4-6"
@@ -1911,6 +2054,7 @@ harness:
         # Playwright tools: readOnlyHint varies (navigation=true, clicks=false)
       invocation: "always"
       skepticism_level: "high"
+      failure_taxonomy: true           # require failure_class from Phase 4.4 taxonomy in all failure reports
       max_turns: 50
       max_budget_usd: 20.00
       reads: ["openspec/", "epics/stories/", "_bmad/ux-spec.md", ".harness/contracts/", "ops/e2e-test-plan.md"]
@@ -1963,6 +2107,10 @@ harness:
     - name: "Robustness"
       weight: 0.10
       hard_fail: "security vulnerability or data loss"
+
+  # Simplicity is NOT a weighted criterion — it is a tiebreaker (see Phase 4.3).
+  # When two solutions score equally on all weighted criteria above, prefer the simpler one.
+  simplicity_tiebreaker: true
 ```
 
 ---
@@ -2061,7 +2209,7 @@ traces:
       handoff: ".harness/handoffs/handoff-sprint-5.yaml"
       evaluation: ".harness/evaluations/eval-sprint-5.yaml"
       retry_count: 2
-      failure_class: "phantom coverage — tests cited REQ-* but didn't exercise it"
+      failure_class: "MISSING_VERIFY"  # from Phase 4.4 taxonomy — phantom coverage
       agent: "generator"
 
   evaluator_traces:  # separate track for evaluator skill evolution
@@ -2121,7 +2269,8 @@ Patches from all analysts merge hierarchically into a unified skill update. The 
 2. **Deduplicate**: When multiple patches propose the same edit, keep the best-worded version
 3. **Resolve conflicts**: When patches propose contradictory edits, choose the one with stronger causal evidence or synthesize both
 4. **Filter by prevalence**: Patches that appear independently in multiple traces are treated as systematic patterns — they go into the main skill document. Patches from a single trace are treated as edge cases — they go into `references/`
-5. **Validate**: The merged patch must not introduce contradictions with existing skill content
+5. **Overfitting guard**: For each patch, ask: *"If this exact task disappeared, would this still be a worthwhile harness improvement?"* If the answer is no, the patch is overfitting to a specific task — discard it. This prevents benchmark-specific keyword rules, task-specific hacks, and hardcoded solutions from leaking into evolved prompts.
+6. **Validate**: The merged patch must not introduce contradictions with existing skill content
 
 **Prevalence tiers**:
 
@@ -2292,6 +2441,7 @@ ORCHESTRATE:
 - [ ] Set up E2E testing capability (Playwright, API harness, or equivalent)
 - [ ] Write `ops/e2e-test-plan.md` mapping SCENARIO-* to E2E test procedures
 - [ ] Calibrate evaluator against known-good and known-bad examples
+- [ ] Configure evaluator to use failure classification taxonomy (Phase 4.4) — every failure report must include a `failure_class`
 
 ### Testing Architecture (Phase 5)
 
@@ -2352,6 +2502,11 @@ ORCHESTRATE:
 - [ ] Create `.harness/patches/` directory for intermediate patch artifacts
 - [ ] Write `.harness/prompts/skill-evolver.md` with error/success analyst instructions
 - [ ] Initialize `.harness/skills/changelog.yaml` with version 1.0.0 (initial human-authored prompts)
+- [ ] Add editable/fixed section boundary markers to all `.harness/prompts/*.md` files and orchestration scripts
+- [ ] Configure autonomous mode in `.harness/config.yaml` (enabled, max_iterations, max_budget_usd, stop_on_repeated_failure)
+- [ ] Create `.harness/results.tsv` ledger template (commit | pass_rate | passed | failed | cost_usd | status | description)
+- [ ] Configure generator verification sub-agent in `.harness/config.yaml` (optional pre-submission sanity check)
+- [ ] Review all custom tools against Appendix F tool design principles (naming, structured data, error messages, annotations)
 - [ ] Configure evolution trigger in `.harness/config.yaml` (default: every 5 sprints)
 - [ ] Configure failure spike threshold (default: 3 consecutive failures → immediate evolution)
 - [ ] Set prevalence thresholds for patch filtering (high ≥30%, medium 10-30%, low <10%)
@@ -2466,6 +2621,7 @@ For projects that don't need the full BMAD ceremony:
 | E2E tests only at the end | Integration bugs compound across sprints; late discovery = expensive rework | E2E per sprint, not just final evaluation |
 | No negative tests | Happy path tested, error paths assumed to work | Every SCENARIO-* that specifies error behavior must have a negative test |
 | Mocking at integration boundaries | Mocks can diverge from real behavior; prior incidents where mocked tests pass but production fails | Integration tests use real dependencies (DB, services); mocks only in unit tests for external deps |
+| Evaluator failures without classification | Failures described in prose are hard to aggregate, hard to feed into Trace2Skill, and hard to detect repeated failure classes | Require failure_class from Phase 4.4 taxonomy on every failure report; autonomous mode uses class equality for stop-on-repeated-failure |
 | Static agent prompts that never improve | Same prompt failures repeat across sprints; evaluator catches the same classes of issues repeatedly | Trace2Skill evolution loop: analyze traces, extract patches, consolidate into evolved prompts (Phase 8) |
 | Sequential trace analysis (one at a time) | Overfits to individual trajectory quirks; misses systematic patterns | Parallel independent analysts + prevalence-weighted consolidation (high-prevalence → prompt, low → references/) |
 | Evolving prompts without measuring effectiveness | No way to know if evolution helped or hurt | Track pre/post evolution pass rates; revert if pass rate decreases |
@@ -2633,6 +2789,88 @@ Additional optimizations:
 - **Subagents within agents**: The generator can spawn read-only subagents for research tasks (e.g., "find all usages of this function") that return only a summary, keeping the generator's context lean
 - **Prompt caching**: Content that stays the same across turns (system prompt, tool definitions, CLAUDE.md) is automatically prompt-cached by the API, reducing cost by up to 80% on repeated prefixes. Structure agent prompts with stable content at the top.
 - **Handoff artifacts are context-efficient by design**: A structured YAML handoff is far smaller than the full conversation history it replaces. This is another reason context resets outperform compaction — the reset + handoff approach uses fewer tokens than compacting a long conversation.
+
+---
+
+## Appendix F: Tool Design Principles
+
+When building custom tools for agents (MCP servers, SDK tool functions, or shell wrappers), follow these principles to maximize agent effectiveness and minimize wasted tokens.
+
+### F.1 Specialize Over Generalize
+
+A single generic `run_shell` tool forces the agent to embed boilerplate in every call — constructing commands, parsing raw stdout, handling exit codes. This wastes tokens and introduces fragility.
+
+**Instead**: Create purpose-built tools that surface structured data and accept structured input.
+
+| Anti-Pattern | Better |
+|---|---|
+| `run_shell("cat data.xlsx \| python parse.py")` | `read_spreadsheet(file, sheet, range)` |
+| `run_shell("psql -c 'SELECT ...'")` | `query_database(sql, params)` |
+| `run_shell("curl -X POST ...")` | `call_api(endpoint, method, body)` |
+
+**When generic tools are acceptable**: Exploratory phases (Discovery agent) where the problem space is unknown. Once the domain stabilizes, replace generic tools with specialized ones.
+
+### F.2 Tool Names Matter
+
+Models pattern-match tool names **before** reading descriptions. A well-named tool gets selected faster and more accurately than a well-described tool with a generic name.
+
+**Naming rules**:
+- Use verb_noun format: `read_spec`, `write_cell`, `validate_schema`
+- Be specific: `inspect_workbook` not `open_file`
+- Match the domain vocabulary the agent's prompt uses — if the prompt says "recalculate formulas", name the tool `recalculate_formulas` not `refresh_computed_values`
+- Avoid generic prefixes: `do_`, `handle_`, `process_`
+
+### F.3 Return Structured Data, Not Raw Stdout
+
+Raw stdout forces the agent to parse text, which wastes tokens and introduces parsing errors.
+
+```yaml
+# Bad: raw stdout
+tool_result: "Sheet1\n  A1: Name  B1: Age\n  A2: Alice  B2: 30\n..."
+
+# Good: structured data
+tool_result:
+  sheet: "Sheet1"
+  headers: ["Name", "Age"]
+  rows:
+    - {Name: "Alice", Age: 30}
+  row_count: 150
+  truncated: true
+```
+
+**Include metadata**: row counts, truncation flags, available sheets/tables — so the agent knows what it's working with without additional tool calls.
+
+### F.4 Actionable Error Messages
+
+Error messages should tell the agent what to do, not just what went wrong.
+
+```yaml
+# Bad
+error: "ENOENT"
+
+# Good
+error: "File not found: auth/login.py. Did you mean src/auth/login.py? Available files matching 'login': src/auth/login.py, src/auth/login.test.py"
+```
+
+When a tool fails, return `is_error: true` with a structured response — don't throw. This lets the agent react intelligently instead of crashing the loop.
+
+### F.5 Tool Annotations Drive Parallelism
+
+Mark tools correctly so the SDK can parallelize them (see Appendix E.1):
+
+| Annotation | Set `true` when... |
+|---|---|
+| `readOnlyHint` | Tool doesn't modify state — enables parallel execution |
+| `idempotentHint` | Calling twice with same args produces same result — safe to retry |
+| `destructiveHint: false` | Tool creates but doesn't destroy — reduces unnecessary caution |
+| `openWorldHint` | Tool accesses external systems — helps the model reason about freshness |
+
+### F.6 Scope Tools Per Agent
+
+Over-exposing tools wastes context and slows tool selection (see Appendix E.3). Additionally:
+- **Don't expose write tools to read-only agents** — prevents accidental side effects
+- **Don't expose research tools to implementation agents** — prevents rabbit-hole exploration when the agent should be coding
+- **Do expose verification tools to generators** — lightweight in-flight checks reduce evaluator round-trips (see verification sub-agent pattern in Phase 6.3)
 
 ---
 
